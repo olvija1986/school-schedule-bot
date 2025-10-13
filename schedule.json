@@ -1,0 +1,7 @@
+{
+    "Monday": ["Math - 08:00", "English - 09:00", "Physics - 10:00"],
+    "Tuesday": ["Biology - 08:00", "Chemistry - 09:00", "History - 10:00"],
+    "Wednesday": ["Math - 08:00", "Geography - 09:00", "PE - 10:00"],
+    "Thursday": ["English - 08:00", "Physics - 09:00", "Chemistry - 10:00"],
+    "Friday": ["Biology - 08:00", "Math - 09:00", "History - 10:00"]
+}
