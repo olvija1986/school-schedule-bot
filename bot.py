@@ -1,18 +1,21 @@
 import os, json, uuid
 from datetime import datetime, timedelta
-from telegram import InlineQueryResultArticle, InputTextMessageContent, Update
+from fastapi import FastAPI, Request
+from telegram import Update, InlineQueryResultArticle, InputTextMessageContent
 from telegram.ext import ApplicationBuilder, InlineQueryHandler, CommandHandler, ContextTypes
 
-# ================== Загрузка токена ==================
+# ================== Настройки ==================
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
-if not TOKEN:
-    raise ValueError("Не задан TELEGRAM_TOKEN в переменных окружения!")
+BOT_URL = os.environ.get("BOT_URL")  # например: https://inline-dice-bot-7xye.onrender.com
+WEBHOOK_PATH = f"/webhook/{TOKEN}"
+
+if not TOKEN or not BOT_URL:
+    raise RuntimeError("Не заданы TELEGRAM_TOKEN или BOT_URL")
 
 # ================== Загрузка расписания ==================
 with open("schedule.json", "r", encoding="utf-8") as f:
     schedule = json.load(f)
 
-# ================== Маппинг английских дней на русские ==================
 DAY_MAP = {
     "Monday": "Понедельник",
     "Tuesday": "Вторник",
@@ -62,7 +65,6 @@ async def inline_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
             title="Расписание на неделю",
             input_message_content=InputTextMessageContent(text.strip())
         ))
-
     else:
         results.append(InlineQueryResultArticle(
             id=str(uuid.uuid4()),
@@ -76,11 +78,38 @@ async def inline_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я бот для школьного расписания.\n"
-        "Используй inline-запрос: @rasp7V_bot today / tomorrow / week"
+        "Используй inline-запрос: @твой_бот today / tomorrow / week"
     )
 
-# ================== Основной запуск ==================
-app = ApplicationBuilder().token(TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(InlineQueryHandler(inline_schedule))
-app.run_polling()
+# ================== FastAPI ==================
+app = FastAPI()
+bot_app = ApplicationBuilder().token(TOKEN).build()
+bot_app.add_handler(CommandHandler("start", start))
+bot_app.add_handler(InlineQueryHandler(inline_schedule))
+
+# ================== Webhook ==================
+@app.post(WEBHOOK_PATH)
+async def telegram_webhook(request: Request):
+    data = await request.json()
+    update = Update.de_json(data, bot_app.bot)
+    await bot_app.update_queue.put(update)
+    return {"ok": True}
+
+# ================== Lifespan ==================
+@app.on_event("startup")
+async def startup_event():
+    await bot_app.initialize()
+    await bot_app.bot.set_webhook(f"{BOT_URL}{WEBHOOK_PATH}")
+    await bot_app.start()
+    print("✅ Webhook установлен, бот готов к работе")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await bot_app.stop()
+    await bot_app.shutdown()
+    print("🛑 Бот остановлен")
+
+# ================== Стартовая страница ==================
+@app.get("/")
+def root():
+    return {"status": "Bot is running ✅"}
