@@ -5,10 +5,23 @@ from telegram.ext import ApplicationBuilder, InlineQueryHandler, CommandHandler,
 
 # ================== Загрузка токена ==================
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
+if not TOKEN:
+    raise ValueError("Не задан TELEGRAM_TOKEN в переменных окружения!")
 
 # ================== Загрузка расписания ==================
 with open("schedule.json", "r", encoding="utf-8") as f:
     schedule = json.load(f)
+
+# ================== Маппинг английских дней на русские ==================
+DAY_MAP = {
+    "Monday": "Понедельник",
+    "Tuesday": "Вторник",
+    "Wednesday": "Среда",
+    "Thursday": "Четверг",
+    "Friday": "Пятница",
+    "Saturday": "Суббота",
+    "Sunday": "Воскресенье"
+}
 
 # ================== Inline-запросы ==================
 async def inline_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -19,7 +32,8 @@ async def inline_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     results = []
 
     if query in ["today", "сегодня"]:
-        day = datetime.today().strftime("%A")
+        day_eng = datetime.today().strftime("%A")
+        day = DAY_MAP.get(day_eng, "Сегодня")
         lessons = schedule.get(day, ["Сегодня нет занятий"])
         text = "\n".join(lessons)
         results.append(InlineQueryResultArticle(
@@ -29,7 +43,8 @@ async def inline_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ))
 
     elif query in ["tomorrow", "завтра"]:
-        day = (datetime.today() + timedelta(days=1)).strftime("%A")
+        day_eng = (datetime.today() + timedelta(days=1)).strftime("%A")
+        day = DAY_MAP.get(day_eng, "Завтра")
         lessons = schedule.get(day, ["Завтра нет занятий"])
         text = "\n".join(lessons)
         results.append(InlineQueryResultArticle(
@@ -49,7 +64,6 @@ async def inline_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ))
 
     else:
-        # Если пользователь ввёл что-то непонятное
         results.append(InlineQueryResultArticle(
             id=str(uuid.uuid4()),
             title="Введите today, tomorrow или week",
