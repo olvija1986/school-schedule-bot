@@ -152,7 +152,7 @@ async def startup_event():
 
     # Автоотправка расписания в 9:00 (по Москве)
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
-    scheduler.add_job(send_daily_schedule, CronTrigger(hour=9, minute=0))
+    scheduler.add_job(send_daily_schedule, CronTrigger(hour=7, minute=0))
     scheduler.start()
     print("🕘 Автоотправка расписания включена (каждый день в 09:00 МСК)")
 
