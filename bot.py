@@ -3,6 +3,9 @@ import json
 import uuid
 import asyncio
 import httpx
+import sys, telegram
+print(f"🐍 Python {sys.version}")
+print(f"📦 PTB version: {telegram.__version__}")
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
 from telegram import Update, InlineQueryResultArticle, InputTextMessageContent
