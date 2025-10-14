@@ -7,14 +7,19 @@ from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
 from telegram import Update, InlineQueryResultArticle, InputTextMessageContent
 from telegram.ext import ApplicationBuilder, InlineQueryHandler, CommandHandler, ContextTypes
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 # ================== Настройки ==================
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 BOT_URL = os.environ.get("BOT_URL")  # например: https://school-schedule-bot.onrender.com
+CHAT_ID = os.environ.get("CHAT_ID")  # ID чата, куда отправлять расписание
 WEBHOOK_PATH = f"/webhook/{TOKEN}"
 
 if not TOKEN or not BOT_URL:
     raise RuntimeError("Не заданы TELEGRAM_TOKEN или BOT_URL")
+if not CHAT_ID:
+    print("⚠️ Переменная CHAT_ID не задана — автоотправка не будет работать")
 
 # ================== Загрузка расписания ==================
 with open("schedule.json", "r", encoding="utf-8") as f:
@@ -111,6 +116,21 @@ async def ping_self():
             print(f"[Ping error] {e}")
         await asyncio.sleep(600)  # каждые 10 минут
 
+# ================== Автоотправка расписания ==================
+async def send_daily_schedule():
+    """Отправляет расписание на сегодня в указанный чат"""
+    if not CHAT_ID:
+        return
+    try:
+        day_eng = datetime.today().strftime("%A")
+        day = DAY_MAP.get(day_eng, "Сегодня")
+        lessons = schedule.get(day, ["Сегодня нет занятий"])
+        text = f"📅 Расписание на сегодня ({day}):\n\n" + "\n".join(lessons)
+        await bot_app.bot.send_message(chat_id=CHAT_ID, text=text)
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Расписание отправлено в чат {CHAT_ID}")
+    except Exception as e:
+        print(f"[Send schedule error] {e}")
+
 # ================== Lifespan ==================
 @app.on_event("startup")
 async def startup_event():
@@ -119,8 +139,14 @@ async def startup_event():
     await bot_app.start()
     print("✅ Webhook установлен, бот готов к работе")
 
-    # Запускаем фоновый ping Render
+    # Пинг каждые 10 минут
     asyncio.create_task(ping_self())
+
+    # Автоотправка расписания в 9:00 (по Москве)
+    scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
+    scheduler.add_job(send_daily_schedule, CronTrigger(hour=9, minute=0))
+    scheduler.start()
+    print("🕘 Автоотправка расписания включена (каждый день в 09:00 МСК)")
 
 @app.on_event("shutdown")
 async def shutdown_event():
