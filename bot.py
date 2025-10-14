@@ -1,23 +1,24 @@
 import os
 import json
 import uuid
-import asyncio
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
-import httpx
 from telegram import Update, InlineQueryResultArticle, InputTextMessageContent
 from telegram.ext import ApplicationBuilder, InlineQueryHandler, CommandHandler, ContextTypes
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ================== Настройки ==================
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
-BOT_URL = os.environ.get("BOT_URL")  # например: https://my-bot.onrender.com
-CHAT_IDS = os.environ.get("CHAT_IDS", "")  # через запятую: "123456,789012"
+BOT_URL = os.environ.get("BOT_URL")  # например: https://inline-dice-bot-7xye.onrender.com
 WEBHOOK_PATH = f"/webhook/{TOKEN}"
+
+# Чаты для авторассылки через запятую: "chat_id1,chat_id2"
+CHAT_IDS = os.environ.get("CHAT_IDS")
+if CHAT_IDS:
+    CHAT_IDS = [int(cid.strip()) for cid in CHAT_IDS.split(",")]
 
 if not TOKEN or not BOT_URL:
     raise RuntimeError("Не заданы TELEGRAM_TOKEN или BOT_URL")
-
-chat_ids = [int(x) for x in CHAT_IDS.split(",") if x.strip()]
 
 # ================== Загрузка расписания ==================
 with open("schedule.json", "r", encoding="utf-8") as f:
@@ -102,38 +103,27 @@ async def telegram_webhook(request: Request):
     await bot_app.update_queue.put(update)
     return {"ok": True}
 
-# ================== Фоновые задачи ==================
-async def ping_self():
-    """Пингуем сам Render каждые 10 минут, чтобы не засыпал."""
-    while True:
+# ================== Авторассылка ==================
+scheduler = AsyncIOScheduler()
+
+async def send_daily_schedule():
+    if not CHAT_IDS:
+        print("⚠️ CHAT_IDS не заданы — автоотправка не будет работать")
+        return
+
+    day_eng = datetime.today().strftime("%A")
+    day = DAY_MAP.get(day_eng, "Сегодня")
+    lessons = schedule.get(day, ["Сегодня нет занятий"])
+    text = f"Расписание на сегодня ({day}):\n" + "\n".join(lessons)
+
+    for chat_id in CHAT_IDS:
         try:
-            async with httpx.AsyncClient() as client:
-                await client.get(BOT_URL)
-        except Exception:
-            pass
-        await asyncio.sleep(600)  # 10 минут
+            await bot_app.bot.send_message(chat_id=chat_id, text=text)
+        except Exception as e:
+            print(f"Ошибка при отправке в чат {chat_id}: {e}")
 
-async def daily_schedule():
-    """Отправка расписания в 09:00 каждый день в указанные чаты."""
-    while True:
-        now = datetime.now()
-        target = now.replace(hour=9, minute=0, second=0, microsecond=0)
-        if now >= target:
-            target += timedelta(days=1)
-        wait_seconds = (target - now).total_seconds()
-        await asyncio.sleep(wait_seconds)
-
-        if chat_ids:
-            day_eng = datetime.today().strftime("%A")
-            day = DAY_MAP.get(day_eng, "Сегодня")
-            lessons = schedule.get(day, ["Сегодня нет занятий"])
-            text = f"Расписание на сегодня ({day}):\n" + "\n".join(lessons)
-
-            for chat_id in chat_ids:
-                try:
-                    await bot_app.bot.send_message(chat_id=chat_id, text=text)
-                except Exception:
-                    pass
+# Запланировать каждый день в 09:00
+scheduler.add_job(send_daily_schedule, "cron", hour=9, minute=0)
 
 # ================== Lifespan ==================
 @app.on_event("startup")
@@ -141,10 +131,8 @@ async def startup_event():
     await bot_app.initialize()
     await bot_app.bot.set_webhook(f"{BOT_URL}{WEBHOOK_PATH}")
     await bot_app.start()
-    # Запускаем фоновые таски
-    asyncio.create_task(ping_self())
-    asyncio.create_task(daily_schedule())
-    print("✅ Webhook установлен, фоновые задачи запущены, бот готов к работе")
+    scheduler.start()
+    print("✅ Webhook установлен, бот готов к работе")
 
 @app.on_event("shutdown")
 async def shutdown_event():
