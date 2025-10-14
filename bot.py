@@ -1,4 +1,8 @@
-import os, json, uuid
+import os
+import json
+import uuid
+import asyncio
+import httpx
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
 from telegram import Update, InlineQueryResultArticle, InputTextMessageContent
@@ -6,7 +10,7 @@ from telegram.ext import ApplicationBuilder, InlineQueryHandler, CommandHandler,
 
 # ================== Настройки ==================
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
-BOT_URL = os.environ.get("BOT_URL")  # например: https://inline-dice-bot-7xye.onrender.com
+BOT_URL = os.environ.get("BOT_URL")  # например: https://school-schedule-bot.onrender.com
 WEBHOOK_PATH = f"/webhook/{TOKEN}"
 
 if not TOKEN or not BOT_URL:
@@ -95,6 +99,18 @@ async def telegram_webhook(request: Request):
     await bot_app.update_queue.put(update)
     return {"ok": True}
 
+# ================== Ping Render ==================
+async def ping_self():
+    """Периодически пингует сам себя, чтобы Render Free не засыпал"""
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(f"{BOT_URL}/")
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔁 Ping status: {resp.status_code}")
+        except Exception as e:
+            print(f"[Ping error] {e}")
+        await asyncio.sleep(600)  # каждые 10 минут
+
 # ================== Lifespan ==================
 @app.on_event("startup")
 async def startup_event():
@@ -102,6 +118,9 @@ async def startup_event():
     await bot_app.bot.set_webhook(f"{BOT_URL}{WEBHOOK_PATH}")
     await bot_app.start()
     print("✅ Webhook установлен, бот готов к работе")
+
+    # Запускаем фоновый ping Render
+    asyncio.create_task(ping_self())
 
 @app.on_event("shutdown")
 async def shutdown_event():
