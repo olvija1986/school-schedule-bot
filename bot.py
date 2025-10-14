@@ -13,13 +13,18 @@ from apscheduler.triggers.cron import CronTrigger
 # ================== Настройки ==================
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 BOT_URL = os.environ.get("BOT_URL")  # например: https://school-schedule-bot.onrender.com
-CHAT_ID = os.environ.get("CHAT_ID")  # ID чата, куда отправлять расписание
+CHAT_IDS = os.environ.get("CHAT_IDS")  # несколько ID через запятую
 WEBHOOK_PATH = f"/webhook/{TOKEN}"
 
 if not TOKEN or not BOT_URL:
     raise RuntimeError("Не заданы TELEGRAM_TOKEN или BOT_URL")
-if not CHAT_ID:
-    print("⚠️ Переменная CHAT_ID не задана — автоотправка не будет работать")
+
+# список чатов
+if CHAT_IDS:
+    CHAT_IDS = [chat_id.strip() for chat_id in CHAT_IDS.split(",") if chat_id.strip()]
+else:
+    CHAT_IDS = []
+    print("⚠️ Переменная CHAT_IDS не задана — автоотправка не будет работать")
 
 # ================== Загрузка расписания ==================
 with open("schedule.json", "r", encoding="utf-8") as f:
@@ -118,18 +123,21 @@ async def ping_self():
 
 # ================== Автоотправка расписания ==================
 async def send_daily_schedule():
-    """Отправляет расписание на сегодня в указанный чат"""
-    if not CHAT_ID:
+    """Отправляет расписание на сегодня во все указанные чаты"""
+    if not CHAT_IDS:
         return
-    try:
-        day_eng = datetime.today().strftime("%A")
-        day = DAY_MAP.get(day_eng, "Сегодня")
-        lessons = schedule.get(day, ["Сегодня нет занятий"])
-        text = f"📅 Расписание на сегодня ({day}):\n\n" + "\n".join(lessons)
-        await bot_app.bot.send_message(chat_id=CHAT_ID, text=text)
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Расписание отправлено в чат {CHAT_ID}")
-    except Exception as e:
-        print(f"[Send schedule error] {e}")
+
+    day_eng = datetime.today().strftime("%A")
+    day = DAY_MAP.get(day_eng, "Сегодня")
+    lessons = schedule.get(day, ["Сегодня нет занятий"])
+    text = f"📅 Расписание на сегодня ({day}):\n\n" + "\n".join(lessons)
+
+    for chat_id in CHAT_IDS:
+        try:
+            await bot_app.bot.send_message(chat_id=chat_id, text=text)
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Расписание отправлено в чат {chat_id}")
+        except Exception as e:
+            print(f"[Send schedule error {chat_id}] {e}")
 
 # ================== Lifespan ==================
 @app.on_event("startup")
