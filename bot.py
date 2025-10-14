@@ -6,7 +6,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-TOKEN = os.getenv("TOKEN")
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_IDS = os.getenv("CHAT_IDS")  # через запятую: "123456,789012"
 
 app = FastAPI()
