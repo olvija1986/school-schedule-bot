@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 import httpx
 from fastapi import FastAPI, Request
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from telegram import Update, InlineQueryResultArticle, InputTextMessageContent
 from telegram.ext import ApplicationBuilder, InlineQueryHandler, CommandHandler, ContextTypes
 
@@ -110,8 +111,10 @@ async def scheduled_message():
             except Exception as e:
                 print(f"Ошибка отправки в {chat_id}: {e}")
 
+# Рассылка каждый день в 7:00 кроме субботы и воскресенья
+trigger = CronTrigger(hour=7, minute=0, day_of_week='mon-fri')
 scheduler = AsyncIOScheduler()
-scheduler.add_job(scheduled_message, "interval", seconds=3600)  # каждые 1 час
+scheduler.add_job(scheduled_message, trigger)
 
 # ================== Webhook endpoint ==================
 @app.post(WEBHOOK_PATH)
