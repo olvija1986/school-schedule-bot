@@ -6,7 +6,7 @@ from telegram.ext import ApplicationBuilder, InlineQueryHandler, CommandHandler,
 
 # ================== Настройки ==================
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
-BOT_URL = os.environ.get("BOT_URL")  # Например: https://school-schedule-bot.onrender.com
+BOT_URL = os.environ.get("BOT_URL")  # например: https://school-schedule-bot.onrender.com
 WEBHOOK_PATH = f"/webhook/{TOKEN}"
 
 if not TOKEN or not BOT_URL:
@@ -94,7 +94,6 @@ bot_app.add_handler(InlineQueryHandler(inline_schedule))
 async def telegram_webhook(request: Request):
     data = await request.json()
     update = Update.de_json(data, bot_app.bot)
-    # ✅ Новый способ вместо update_queue:
     await bot_app.process_update(update)
     return {"ok": True}
 
@@ -106,7 +105,7 @@ async def startup_event():
     await bot_app.start()
     print("✅ Webhook установлен, бот готов к работе")
 
-    # ================== Ping self ==================
+    # --- Автопинг для Render ---
     async def ping_self():
         async with httpx.AsyncClient(timeout=10.0) as client:
             while True:
