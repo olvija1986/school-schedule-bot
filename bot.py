@@ -30,6 +30,7 @@ DAY_MAP = {
 async def inline_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.inline_query.query.lower().strip()
     if not query:
+        await update.inline_query.answer([], cache_time=0)
         return
 
     results = []
@@ -93,25 +94,27 @@ bot_app.add_handler(InlineQueryHandler(inline_schedule))
 async def telegram_webhook(request: Request):
     data = await request.json()
     update = Update.de_json(data, bot_app.bot)
-    await bot_app.update_queue.put(update)
+    # ✅ Новый способ вместо update_queue:
+    await bot_app.process_update(update)
     return {"ok": True}
 
 # ================== Lifespan ==================
 @app.on_event("startup")
 async def startup_event():
     await bot_app.initialize()
-    await bot_app.bot.set_webhook(f"{BOT_URL}{WEBHOOK_PATH}")
+    await bot_app.bot.set_webhook(f"{BOT_URL.rstrip('/')}{WEBHOOK_PATH}")
     await bot_app.start()
     print("✅ Webhook установлен, бот готов к работе")
 
     # ================== Ping self ==================
     async def ping_self():
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             while True:
                 try:
-                    await client.get(BOT_URL)
+                    resp = await client.get(BOT_URL)
+                    print(f"[ping] {resp.status_code} {datetime.now().strftime('%H:%M:%S')}")
                 except Exception as e:
-                    print(f"Ping error: {e}")
+                    print(f"[ping error] {e}")
                 await asyncio.sleep(600)  # каждые 10 минут
 
     asyncio.create_task(ping_self())
