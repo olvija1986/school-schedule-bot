@@ -1,5 +1,5 @@
 import os, json, uuid, asyncio, httpx, html, re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from fastapi import FastAPI, Request
 from zoneinfo import ZoneInfo
 from telegram import (
@@ -233,7 +233,7 @@ def _get_tz() -> ZoneInfo:
     except Exception:
         return ZoneInfo("UTC")
 
-def _parse_date_str(s: str) -> datetime.date | None:
+def _parse_date_str(s: str) -> date | None:
     s = (s or "").strip().lower()
     today = datetime.now(tz=_get_tz()).date()
     if s == "сегодня":
@@ -256,7 +256,7 @@ def _parse_hhmm(s: str) -> tuple[int, int] | None:
         return None
     return h, mi
 
-def _get_lessons_for_date(d: datetime.date) -> tuple[str, list[str]]:
+def _get_lessons_for_date(d: date) -> tuple[str, list[str]]:
     """Возвращает (название_дня_по-русски, список_уроков) с учётом временного расписания."""
     key = d.isoformat()
     if key in temp_schedule:
