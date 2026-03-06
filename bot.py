@@ -2,6 +2,7 @@ import os, json, uuid, asyncio, httpx
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
 from telegram import (
+    BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
@@ -78,7 +79,40 @@ def _save_schedule_to_disk() -> None:
 async def inline_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.inline_query.query.lower().strip()
     if not query:
-        await update.inline_query.answer([], cache_time=0)
+        # Подсказки, когда пользователь только открыл inline-режим
+        day_eng = datetime.today().strftime("%A")
+        today_day = DAY_MAP.get(day_eng, "Сегодня")
+        today_lessons = schedule.get(today_day, ["Сегодня нет занятий"])
+
+        tomorrow_eng = (datetime.today() + timedelta(days=1)).strftime("%A")
+        tomorrow_day = DAY_MAP.get(tomorrow_eng, "Завтра")
+        tomorrow_lessons = schedule.get(tomorrow_day, ["Завтра нет занятий"])
+
+        week_text = ""
+        for day, lessons in schedule.items():
+            week_text += f"{day}:\n" + "\n".join(lessons) + "\n\n"
+
+        results = [
+            InlineQueryResultArticle(
+                id=str(uuid.uuid4()),
+                title=f"Сегодня ({today_day})",
+                description="Подсказка: запрос today / сегодня",
+                input_message_content=InputTextMessageContent("\n".join(today_lessons)),
+            ),
+            InlineQueryResultArticle(
+                id=str(uuid.uuid4()),
+                title=f"Завтра ({tomorrow_day})",
+                description="Подсказка: запрос tomorrow / завтра",
+                input_message_content=InputTextMessageContent("\n".join(tomorrow_lessons)),
+            ),
+            InlineQueryResultArticle(
+                id=str(uuid.uuid4()),
+                title="Неделя",
+                description="Подсказка: запрос week / неделя",
+                input_message_content=InputTextMessageContent(week_text.strip() or "Расписание пустое"),
+            ),
+        ]
+        await update.inline_query.answer(results, cache_time=0)
         return
 
     results = []
@@ -130,6 +164,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Привет! Я бот для школьного расписания.\n"
         "Используй inline-запрос: @rasp7V_bot today / tomorrow / week\n"
         "Для админов: /edit_schedule — редактировать расписание"
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Команды:\n"
+        "/start — приветствие\n"
+        "/help — помощь\n"
+        "/edit_schedule — редактировать расписание (если разрешено)\n"
+        "/cancel — отменить редактирование\n\n"
+        "Inline-режим:\n"
+        "Набери @бота и выбери подсказку или введи: today / tomorrow / week\n\n"
+        "Редактирование в группе с privacy mode:\n"
+        "После выбора дня можно отправить:\n"
+        "/set <список уроков, каждый с новой строки>\n"
+        "или /set пусто"
     )
 
 # ================== Редактирование расписания (/edit_schedule) ==================
@@ -322,6 +371,7 @@ async def edit_schedule_cancel(update: Update, context: ContextTypes.DEFAULT_TYP
 app = FastAPI()
 bot_app = ApplicationBuilder().token(TOKEN).build()
 bot_app.add_handler(CommandHandler("start", start))
+bot_app.add_handler(CommandHandler("help", help_command))
 
 edit_conv = ConversationHandler(
     entry_points=[CommandHandler("edit_schedule", edit_schedule_start)],
@@ -351,6 +401,15 @@ async def telegram_webhook(request: Request):
 async def startup_event():
     await bot_app.initialize()
     await bot_app.bot.set_webhook(f"{BOT_URL.rstrip('/')}{WEBHOOK_PATH}")
+    # Подсказки команд в интерфейсе Telegram (меню при вводе "/")
+    await bot_app.bot.set_my_commands(
+        [
+            BotCommand("start", "Запуск / приветствие"),
+            BotCommand("help", "Подсказки и помощь"),
+            BotCommand("edit_schedule", "Редактировать расписание"),
+            BotCommand("cancel", "Отменить редактирование"),
+        ]
+    )
     await bot_app.start()
     print("✅ Webhook установлен, бот готов к работе")
 
