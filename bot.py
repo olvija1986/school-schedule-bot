@@ -1,6 +1,7 @@
 import os, json, uuid, asyncio, httpx, html, re
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
+from zoneinfo import ZoneInfo
 from telegram import (
     BotCommand,
     InlineKeyboardButton,
@@ -19,6 +20,8 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 # ================== Настройки ==================
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -40,6 +43,10 @@ ADMIN_USER_IDS = {
 # ================== Загрузка расписания ==================
 with open("schedule.json", "r", encoding="utf-8") as f:
     schedule = json.load(f)
+
+SUBSCRIPTIONS_PATH = "subscriptions.json"
+subscriptions: dict[str, dict] = {}
+scheduler: AsyncIOScheduler | None = None
 
 SCHEDULE_DAYS = [
     "Понедельник",
@@ -64,6 +71,27 @@ DAY_MAP = {
 _LESSON_RE = re.compile(
     r"^\s*(?P<start>\d{1,2}:\d{2})\s*-\s*(?P<end>\d{1,2}:\d{2})\s+(?P<rest>.+?)\s*$"
 )
+
+def _load_subscriptions_from_disk() -> None:
+    global subscriptions
+    try:
+        with open(SUBSCRIPTIONS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            subscriptions = data
+        else:
+            subscriptions = {}
+    except FileNotFoundError:
+        subscriptions = {}
+    except Exception:
+        subscriptions = {}
+
+def _save_subscriptions_to_disk() -> None:
+    tmp_path = f"{SUBSCRIPTIONS_PATH}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(subscriptions, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp_path, SUBSCRIPTIONS_PATH)
 
 def _is_admin(update: Update) -> bool:
     if not ADMIN_USER_IDS:
@@ -168,6 +196,66 @@ def _format_day_table_html(day: str, lessons: list[str]) -> str:
 
     pre = html.escape("\n".join(lines))
     return f"<b>{html.escape(day)}</b>\n<pre>{pre}</pre>"
+
+def _get_tz() -> ZoneInfo:
+    # Можно переопределить в Render: TZ=Etc/GMT-5 (UTC+5) или любая IANA TZ
+    # Важно: у Etc/GMT-5 "минус" означает UTC+5 (так устроена зона Etc/*)
+    name = (os.environ.get("TZ") or "Etc/GMT-5").strip()
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return ZoneInfo("UTC")
+
+def _parse_hhmm(s: str) -> tuple[int, int] | None:
+    s = (s or "").strip()
+    m = re.match(r"^(?P<h>\d{1,2}):(?P<m>\d{2})$", s)
+    if not m:
+        return None
+    h = int(m.group("h"))
+    mi = int(m.group("m"))
+    if not (0 <= h <= 23 and 0 <= mi <= 59):
+        return None
+    return h, mi
+
+async def _send_daily_reminder(chat_id: int):
+    # Расписание на сегодня
+    day_eng = datetime.now(tz=_get_tz()).strftime("%A")
+    day = DAY_MAP.get(day_eng, "Сегодня")
+    lessons = schedule.get(day, [])
+    text = _format_day_table_html(day, lessons)
+    await bot_app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+
+def _job_id_for(user_id: int) -> str:
+    return f"reminder:{user_id}"
+
+def _reschedule_user(user_id: int):
+    global scheduler
+    if scheduler is None:
+        return
+    entry = subscriptions.get(str(user_id))
+    job_id = _job_id_for(user_id)
+    try:
+        scheduler.remove_job(job_id)
+    except Exception:
+        pass
+    if not entry:
+        return
+    time_str = entry.get("time", "")
+    parsed = _parse_hhmm(time_str)
+    if not parsed:
+        return
+    hour, minute = parsed
+    chat_id = int(entry.get("chat_id"))
+    trigger = CronTrigger(hour=hour, minute=minute, timezone=_get_tz())
+    scheduler.add_job(
+        _send_daily_reminder,
+        trigger=trigger,
+        args=[chat_id],
+        id=job_id,
+        replace_existing=True,
+        misfire_grace_time=3600,  # если сервис был оффлайн, попытаться догнать в течение часа
+        coalesce=True,
+    )
 
 # ================== Inline-запрос ==================
 async def inline_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -279,6 +367,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help — помощь\n"
         "/edit_schedule — редактировать расписание (если разрешено)\n"
         "/cancel — отменить редактирование\n\n"
+        "Напоминания:\n"
+        "/subscribe 07:30 — присылать расписание каждый день в указанное время\n"
+        "/unsubscribe — отключить напоминания\n\n"
         "Inline-режим:\n"
         "Набери @бота и выбери подсказку или введи: today / tomorrow / week\n\n"
         "Редактирование в группе с privacy mode:\n"
@@ -286,6 +377,48 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/set <список уроков, каждый с новой строки>\n"
         "или /set пусто"
     )
+
+async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    if not context.args:
+        await update.message.reply_text("Формат: /subscribe HH:MM (например /subscribe 07:30)")
+        return
+    parsed = _parse_hhmm(context.args[0])
+    if not parsed:
+        await update.message.reply_text("Неверное время. Формат: HH:MM (например 07:30)")
+        return
+    hh, mm = parsed
+    t = f"{hh:02d}:{mm:02d}"
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat:
+        await update.message.reply_text("Не удалось определить пользователя/чат.")
+        return
+
+    subscriptions[str(user.id)] = {"chat_id": chat.id, "time": t}
+    _save_subscriptions_to_disk()
+    _reschedule_user(user.id)
+    await update.message.reply_text(
+        f"Ок! Буду присылать расписание каждый день в {t} (TZ={_get_tz().key}).\n"
+        "Важно: на Render free напоминания приходят только пока сервис не спит. Keep-alive помогает."
+    )
+
+async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    user = update.effective_user
+    if not user:
+        await update.message.reply_text("Не удалось определить пользователя.")
+        return
+    subscriptions.pop(str(user.id), None)
+    _save_subscriptions_to_disk()
+    if scheduler is not None:
+        try:
+            scheduler.remove_job(_job_id_for(user.id))
+        except Exception:
+            pass
+    await update.message.reply_text("Готово. Напоминания отключены.")
 
 # ================== Редактирование расписания (/edit_schedule) ==================
 EDIT_CHOOSE_DAY, EDIT_ENTER_LESSONS, EDIT_CONFIRM = range(3)
@@ -478,6 +611,8 @@ app = FastAPI()
 bot_app = ApplicationBuilder().token(TOKEN).build()
 bot_app.add_handler(CommandHandler("start", start))
 bot_app.add_handler(CommandHandler("help", help_command))
+bot_app.add_handler(CommandHandler("subscribe", subscribe))
+bot_app.add_handler(CommandHandler("unsubscribe", unsubscribe))
 
 edit_conv = ConversationHandler(
     entry_points=[CommandHandler("edit_schedule", edit_schedule_start)],
@@ -513,9 +648,21 @@ async def startup_event():
             BotCommand("start", "Запуск / приветствие"),
             BotCommand("help", "Подсказки и помощь"),
             BotCommand("edit_schedule", "Редактировать расписание"),
+            BotCommand("subscribe", "Ежедневное напоминание (HH:MM)"),
+            BotCommand("unsubscribe", "Отключить напоминания"),
             BotCommand("cancel", "Отменить редактирование"),
         ]
     )
+
+    # Планировщик напоминаний
+    global scheduler
+    scheduler = AsyncIOScheduler(timezone=_get_tz())
+    _load_subscriptions_from_disk()
+    for user_id_str in list(subscriptions.keys()):
+        if user_id_str.isdigit():
+            _reschedule_user(int(user_id_str))
+    scheduler.start()
+
     await bot_app.start()
     print("✅ Webhook установлен, бот готов к работе")
 
