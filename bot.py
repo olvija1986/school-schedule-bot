@@ -372,10 +372,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/unsubscribe — отключить напоминания\n\n"
         "Inline-режим:\n"
         "Набери @бота и выбери подсказку или введи: today / tomorrow / week\n\n"
-        "Редактирование в группе с privacy mode:\n"
-        "После выбора дня можно отправить:\n"
-        "/set <список уроков, каждый с новой строки>\n"
-        "или /set пусто"
     )
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -400,8 +396,7 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _save_subscriptions_to_disk()
     _reschedule_user(user.id)
     await update.message.reply_text(
-        f"Ок! Буду присылать расписание каждый день в {t} (TZ={_get_tz().key}).\n"
-        "Важно: на Render free напоминания приходят только пока сервис не спит. Keep-alive помогает."
+        f"Ок! Буду присылать расписание каждый день в {t}.\n"
     )
 
 async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
