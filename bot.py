@@ -191,10 +191,20 @@ async def edit_schedule_day_chosen(update: Update, context: ContextTypes.DEFAULT
     await query.edit_message_text(
         f"Текущие занятия для «{day}»:\n{current_text}\n\n"
         "Пришли новое расписание одним сообщением: по одной строке на урок.\n"
+        "Если ты делаешь это в группе и у бота включён privacy mode — отправь так:\n"
+        "/set <каждая строка = один урок>\n"
         "Чтобы очистить день — отправь слово: пусто\n"
         "Чтобы отменить — /cancel",
     )
     return EDIT_ENTER_LESSONS
+
+def _parse_lessons_from_text(text: str) -> list[str] | None:
+    text = (text or "").strip()
+    if not text:
+        return None
+    if text.lower() in {"пусто", "нет", "clear"}:
+        return []
+    return [line.strip() for line in text.splitlines() if line.strip()]
 
 async def edit_schedule_lessons_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
@@ -206,15 +216,10 @@ async def edit_schedule_lessons_entered(update: Update, context: ContextTypes.DE
         await update.message.reply_text("Сессия редактирования потеряна. Запусти заново: /edit_schedule")
         return ConversationHandler.END
 
-    text = (update.message.text or "").strip()
-    if not text:
+    lessons = _parse_lessons_from_text(update.message.text or "")
+    if lessons is None:
         await update.message.reply_text("Сообщение пустое. Пришли список уроков или «пусто».")
         return EDIT_ENTER_LESSONS
-
-    if text.lower() in {"пусто", "нет", "clear"}:
-        lessons = []
-    else:
-        lessons = [line.strip() for line in text.splitlines() if line.strip()]
 
     context.user_data["edit_lessons"] = lessons
     preview = "\n".join(lessons) if lessons else "— (пусто) —"
@@ -228,6 +233,47 @@ async def edit_schedule_lessons_entered(update: Update, context: ContextTypes.DE
         ]
     )
 
+    await update.message.reply_text(
+        f"Проверь, что всё верно для «{day}»:\n{preview}",
+        reply_markup=keyboard,
+    )
+    return EDIT_CONFIRM
+
+async def edit_schedule_lessons_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /set для групп с privacy mode (обычные сообщения могут не доходить)."""
+    if not _is_admin(update):
+        await update.message.reply_text("У вас нет прав на редактирование расписания.")
+        return ConversationHandler.END
+
+    day = context.user_data.get("edit_day")
+    if not day:
+        await update.message.reply_text("Сессия редактирования потеряна. Запусти заново: /edit_schedule")
+        return ConversationHandler.END
+
+    raw = update.message.text or ""
+    parts = raw.split(None, 1)
+    payload = parts[1] if len(parts) > 1 else ""
+    lessons = _parse_lessons_from_text(payload)
+    if lessons is None:
+        await update.message.reply_text(
+            "После /set нужно прислать список уроков (каждый с новой строки) или слово «пусто».\n"
+            "Пример:\n"
+            "/set 13:30-14:10 Математика/211\n"
+            "14:20-15:00 Информатика/304"
+        )
+        return EDIT_ENTER_LESSONS
+
+    # Переиспользуем общий шаг предпросмотра/подтверждения
+    context.user_data["edit_lessons"] = lessons
+    preview = "\n".join(lessons) if lessons else "— (пусто) —"
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Сохранить", callback_data="edit_confirm"),
+                InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel"),
+            ]
+        ]
+    )
     await update.message.reply_text(
         f"Проверь, что всё верно для «{day}»:\n{preview}",
         reply_markup=keyboard,
@@ -282,6 +328,7 @@ edit_conv = ConversationHandler(
     states={
         EDIT_CHOOSE_DAY: [CallbackQueryHandler(edit_schedule_day_chosen, pattern=r"^edit_")],
         EDIT_ENTER_LESSONS: [
+            CommandHandler("set", edit_schedule_lessons_command),
             MessageHandler(filters.TEXT & ~filters.COMMAND, edit_schedule_lessons_entered)
         ],
         EDIT_CONFIRM: [CallbackQueryHandler(edit_schedule_confirm, pattern=r"^edit_")],
