@@ -1,4 +1,4 @@
-import os, json, uuid, asyncio, httpx
+import os, json, uuid, asyncio, httpx, html, re
 from datetime import datetime, timedelta
 from fastapi import FastAPI, Request
 from telegram import (
@@ -61,6 +61,10 @@ DAY_MAP = {
     "Sunday": "Воскресенье"
 }
 
+_LESSON_RE = re.compile(
+    r"^\s*(?P<start>\d{1,2}:\d{2})\s*-\s*(?P<end>\d{1,2}:\d{2})\s+(?P<rest>.+?)\s*$"
+)
+
 def _is_admin(update: Update) -> bool:
     if not ADMIN_USER_IDS:
         # Если админы не настроены — разрешаем всем (удобно для личного бота)
@@ -75,6 +79,96 @@ def _save_schedule_to_disk() -> None:
         f.write("\n")
     os.replace(tmp_path, "schedule.json")
 
+def _parse_lesson_line(line: str) -> dict:
+    raw = (line or "").strip()
+    if not raw:
+        return {"start": "", "end": "", "subject": "", "room": "", "raw": ""}
+
+    m = _LESSON_RE.match(raw)
+    if m:
+        start = m.group("start")
+        end = m.group("end")
+        rest = m.group("rest").strip()
+    else:
+        start = ""
+        end = ""
+        rest = raw
+
+    if "/" in rest:
+        parts = [p.strip() for p in rest.split("/") if p.strip()]
+        subject = parts[0] if parts else rest
+        room = "/".join(parts[1:]) if len(parts) > 1 else ""
+    else:
+        subject = rest
+        room = ""
+
+    return {"start": start, "end": end, "subject": subject, "room": room, "raw": raw}
+
+def _truncate(text: str, width: int) -> str:
+    text = text or ""
+    if len(text) <= width:
+        return text
+    if width <= 1:
+        return text[:width]
+    return text[: width - 1] + "…"
+
+def _format_day_table_html(day: str, lessons: list[str]) -> str:
+    rows = []
+    for idx, line in enumerate(lessons or [], start=1):
+        p = _parse_lesson_line(line)
+        rows.append(
+            {
+                "n": str(idx),
+                "start": p["start"],
+                "end": p["end"],
+                "subject": p["subject"],
+                "room": p["room"],
+            }
+        )
+
+    # ширины колонок (чтобы не разъезжалось в Telegram)
+    n_w = max(1, min(2, max((len(r["n"]) for r in rows), default=1)))
+    start_w = 5
+    end_w = 5
+    room_w = max(3, min(12, max((len(r["room"]) for r in rows), default=3)))
+    subject_w = max(10, min(28, max((len(r["subject"]) for r in rows), default=10)))
+
+    header = (
+        f"{'#':<{n_w}}  "
+        f"{'Нач':<{start_w}}  "
+        f"{'Кон':<{end_w}}  "
+        f"{'Предмет':<{subject_w}}  "
+        f"{'Каб':<{room_w}}"
+    )
+    sep = (
+        f"{'-'*n_w}  "
+        f"{'-'*start_w}  "
+        f"{'-'*end_w}  "
+        f"{'-'*subject_w}  "
+        f"{'-'*room_w}"
+    )
+
+    lines = [header, sep]
+    if not rows:
+        lines.append(
+            f"{'':<{n_w}}  {'':<{start_w}}  {'':<{end_w}}  "
+            f"{_truncate('Нет занятий', subject_w):<{subject_w}}  {'':<{room_w}}"
+        )
+    else:
+        for r in rows:
+            subj = _truncate(r["subject"], subject_w)
+            room = _truncate(r["room"], room_w)
+            lines.append(
+                f"{r['n']:<{n_w}}  "
+                f"{r['start']:<{start_w}}  "
+                f"{r['end']:<{end_w}}  "
+                f"{subj:<{subject_w}}  "
+                f"{room:<{room_w}}"
+            )
+
+    pre = html.escape("\n".join(lines))
+    return f"<b>{html.escape(day)}</b>\n<pre>{pre}</pre>"
+
 # ================== Inline-запрос ==================
 async def inline_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.inline_query.query.lower().strip()
@@ -82,34 +176,44 @@ async def inline_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Подсказки, когда пользователь только открыл inline-режим
         day_eng = datetime.today().strftime("%A")
         today_day = DAY_MAP.get(day_eng, "Сегодня")
-        today_lessons = schedule.get(today_day, ["Сегодня нет занятий"])
+        today_lessons = schedule.get(today_day, [])
 
         tomorrow_eng = (datetime.today() + timedelta(days=1)).strftime("%A")
         tomorrow_day = DAY_MAP.get(tomorrow_eng, "Завтра")
-        tomorrow_lessons = schedule.get(tomorrow_day, ["Завтра нет занятий"])
-
-        week_text = ""
-        for day, lessons in schedule.items():
-            week_text += f"{day}:\n" + "\n".join(lessons) + "\n\n"
+        tomorrow_lessons = schedule.get(tomorrow_day, [])
 
         results = [
             InlineQueryResultArticle(
                 id=str(uuid.uuid4()),
                 title=f"Сегодня ({today_day})",
                 description="Подсказка: запрос today / сегодня",
-                input_message_content=InputTextMessageContent("\n".join(today_lessons)),
+                input_message_content=InputTextMessageContent(
+                    _format_day_table_html(today_day, today_lessons),
+                    parse_mode="HTML",
+                ),
             ),
             InlineQueryResultArticle(
                 id=str(uuid.uuid4()),
                 title=f"Завтра ({tomorrow_day})",
                 description="Подсказка: запрос tomorrow / завтра",
-                input_message_content=InputTextMessageContent("\n".join(tomorrow_lessons)),
+                input_message_content=InputTextMessageContent(
+                    _format_day_table_html(tomorrow_day, tomorrow_lessons),
+                    parse_mode="HTML",
+                ),
             ),
             InlineQueryResultArticle(
                 id=str(uuid.uuid4()),
                 title="Неделя",
                 description="Подсказка: запрос week / неделя",
-                input_message_content=InputTextMessageContent(week_text.strip() or "Расписание пустое"),
+                input_message_content=InputTextMessageContent(
+                    "\n\n".join(
+                        _format_day_table_html(day, schedule.get(day, []))
+                        for day in SCHEDULE_DAYS
+                        if day in schedule
+                    )
+                    or _format_day_table_html("Неделя", []),
+                    parse_mode="HTML",
+                ),
             ),
         ]
         await update.inline_query.answer(results, cache_time=0)
@@ -120,33 +224,35 @@ async def inline_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query in ["today", "сегодня"]:
         day_eng = datetime.today().strftime("%A")
         day = DAY_MAP.get(day_eng, "Сегодня")
-        lessons = schedule.get(day, ["Сегодня нет занятий"])
-        text = "\n".join(lessons)
+        lessons = schedule.get(day, [])
+        text = _format_day_table_html(day, lessons)
         results.append(InlineQueryResultArticle(
             id=str(uuid.uuid4()),
             title=f"Расписание на сегодня ({day})",
-            input_message_content=InputTextMessageContent(text)
+            input_message_content=InputTextMessageContent(text, parse_mode="HTML")
         ))
 
     elif query in ["tomorrow", "завтра"]:
         day_eng = (datetime.today() + timedelta(days=1)).strftime("%A")
         day = DAY_MAP.get(day_eng, "Завтра")
-        lessons = schedule.get(day, ["Завтра нет занятий"])
-        text = "\n".join(lessons)
+        lessons = schedule.get(day, [])
+        text = _format_day_table_html(day, lessons)
         results.append(InlineQueryResultArticle(
             id=str(uuid.uuid4()),
             title=f"Расписание на завтра ({day})",
-            input_message_content=InputTextMessageContent(text)
+            input_message_content=InputTextMessageContent(text, parse_mode="HTML")
         ))
 
     elif query in ["week", "неделя"]:
-        text = ""
-        for day, lessons in schedule.items():
-            text += f"{day}:\n" + "\n".join(lessons) + "\n\n"
+        text = "\n\n".join(
+            _format_day_table_html(day, schedule.get(day, []))
+            for day in SCHEDULE_DAYS
+            if day in schedule
+        ) or _format_day_table_html("Неделя", [])
         results.append(InlineQueryResultArticle(
             id=str(uuid.uuid4()),
             title="Расписание на неделю",
-            input_message_content=InputTextMessageContent(text.strip())
+            input_message_content=InputTextMessageContent(text.strip(), parse_mode="HTML")
         ))
 
     else:
