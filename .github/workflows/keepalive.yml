@@ -11,4 +11,4 @@ jobs:
     steps:
       - name: Ping Render app
         run: |
-          curl -fsS "https://inline-dice-bot.onrender.com/" >/dev/null
+          curl -fsS "https://school-schedule-bot.onrender.com/" >/dev/null
