@@ -463,100 +463,95 @@ def _get_saturday_inline_results_for_week() -> list[InlineQueryResultArticle]:
     return results
 
 # ================== Inline-запрос ==================
+#
+# Навигация по уровням через текст запроса:
+#   (пусто)           → 3 подсказки: «Сегодня», «Завтра», «Неделя»
+#   сегодня / today   → если суббота с профилями — показывает профили;
+#                       иначе сразу расписание дня
+#   завтра / tomorrow → аналогично
+#   неделя / week     → Пн–Пт одним блоком + подсказки профилей субботы
+#   суббота / saturday→ только профили субботы (текущей недели)
+#
 async def inline_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query_text = (update.inline_query.query or "").lower().strip()
     now = datetime.now(tz=_get_tz())
+    results = []
 
+    # ── Уровень 0: пустой запрос — только три «входные» подсказки ──────────
     if not query_text:
-        # Подсказки, когда пользователь только открыл inline-режим
-        results = []
-
-        # Сегодня
-        today_day, today_lessons = _get_lessons_for_date(now.date())
-        if today_day == "Суббота" and not today_lessons:
-            for label, lessons in _get_saturday_profiles_for_date(now.date()):
-                results.append(InlineQueryResultArticle(
-                    id=str(uuid.uuid4()),
-                    title=f"Сегодня — Суббота ({label})",
-                    description="Подсказка: today / сегодня",
-                    input_message_content=InputTextMessageContent(
-                        _truncate_message(_format_day_table_html(f"Суббота — {label}", lessons)),
-                        parse_mode="HTML",
-                    ),
-                ))
-        else:
-            results.append(InlineQueryResultArticle(
-                id=str(uuid.uuid4()),
-                title=f"Сегодня ({today_day})",
-                description="Подсказка: запрос today / сегодня",
-                input_message_content=InputTextMessageContent(
-                    _truncate_message(_format_day_table_html(today_day, today_lessons)),
-                    parse_mode="HTML",
-                ),
-            ))
-
-        # Завтра
+        today_day, _ = _get_lessons_for_date(now.date())
         tomorrow_date = (now + timedelta(days=1)).date()
-        tomorrow_day, tomorrow_lessons = _get_lessons_for_date(tomorrow_date)
-        if tomorrow_day == "Суббота" and not tomorrow_lessons:
-            for label, lessons in _get_saturday_profiles_for_date(tomorrow_date):
-                results.append(InlineQueryResultArticle(
-                    id=str(uuid.uuid4()),
-                    title=f"Завтра — Суббота ({label})",
-                    description="Подсказка: tomorrow / завтра",
-                    input_message_content=InputTextMessageContent(
-                        _truncate_message(_format_day_table_html(f"Суббота — {label}", lessons)),
-                        parse_mode="HTML",
-                    ),
-                ))
-        else:
-            results.append(InlineQueryResultArticle(
-                id=str(uuid.uuid4()),
-                title=f"Завтра ({tomorrow_day})",
-                description="Подсказка: запрос tomorrow / завтра",
-                input_message_content=InputTextMessageContent(
-                    _truncate_message(_format_day_table_html(tomorrow_day, tomorrow_lessons)),
-                    parse_mode="HTML",
-                ),
-            ))
+        tomorrow_day, _ = _get_lessons_for_date(tomorrow_date)
 
-        # Неделя (без субботы) + суббота по профилям
-        week_no_sat = _format_week_text_without_saturday()
+        # Подсказка «Сегодня»
+        today_label = f"Сегодня — {today_day}"
+        today_hint = "Введите «сегодня» для расписания"
+        if today_day == "Суббота":
+            today_hint = "Введите «сегодня» → выбор профиля"
         results.append(InlineQueryResultArticle(
             id=str(uuid.uuid4()),
-            title="Неделя (Пн–Пт)",
-            description="Расписание на неделю без субботы",
+            title=today_label,
+            description=today_hint,
             input_message_content=InputTextMessageContent(
-                _truncate_message(week_no_sat), parse_mode="HTML"
+                "👆 Введи <b>сегодня</b> в строку поиска, чтобы получить расписание",
+                parse_mode="HTML",
             ),
         ))
-        for sat_result in _get_saturday_inline_results_for_week():
-            results.append(sat_result)
+
+        # Подсказка «Завтра»
+        tomorrow_label = f"Завтра — {tomorrow_day}"
+        tomorrow_hint = "Введите «завтра» для расписания"
+        if tomorrow_day == "Суббота":
+            tomorrow_hint = "Введите «завтра» → выбор профиля"
+        results.append(InlineQueryResultArticle(
+            id=str(uuid.uuid4()),
+            title=tomorrow_label,
+            description=tomorrow_hint,
+            input_message_content=InputTextMessageContent(
+                "👆 Введи <b>завтра</b> в строку поиска, чтобы получить расписание",
+                parse_mode="HTML",
+            ),
+        ))
+
+        # Подсказка «Неделя»
+        results.append(InlineQueryResultArticle(
+            id=str(uuid.uuid4()),
+            title="Неделя",
+            description="Введите «неделя» для расписания на неделю",
+            input_message_content=InputTextMessageContent(
+                "👆 Введи <b>неделя</b> в строку поиска, чтобы получить расписание",
+                parse_mode="HTML",
+            ),
+        ))
 
         await update.inline_query.answer(results, cache_time=0)
         return
 
-    results = []
-
-    if query_text in ["today", "сегодня"]:
+    # ── Уровень 1: сегодня ──────────────────────────────────────────────────
+    if query_text in ["сегодня", "today"]:
         day, lessons = _get_lessons_for_date(now.date())
         if day == "Суббота" and not lessons:
+            # Суббота с профилями — показываем профили как результаты
             for label, prof_lessons in _get_saturday_profiles_for_date(now.date()):
                 text = _truncate_message(_format_day_table_html(f"Суббота — {label}", prof_lessons))
                 results.append(InlineQueryResultArticle(
                     id=str(uuid.uuid4()),
-                    title=f"Сегодня — Суббота ({label})",
-                    input_message_content=InputTextMessageContent(text, parse_mode="HTML")
+                    title=f"{label}",
+                    description=f"Суббота, сегодня — {label}",
+                    input_message_content=InputTextMessageContent(text, parse_mode="HTML"),
                 ))
         else:
             text = _truncate_message(_format_day_table_html(day, lessons))
             results.append(InlineQueryResultArticle(
                 id=str(uuid.uuid4()),
-                title=f"Расписание на сегодня ({day})",
-                input_message_content=InputTextMessageContent(text, parse_mode="HTML")
+                title=f"Сегодня — {day}",
+                input_message_content=InputTextMessageContent(text, parse_mode="HTML"),
             ))
+        await update.inline_query.answer(results, cache_time=0)
+        return
 
-    elif query_text in ["tomorrow", "завтра"]:
+    # ── Уровень 1: завтра ───────────────────────────────────────────────────
+    if query_text in ["завтра", "tomorrow"]:
         tomorrow_date = (now + timedelta(days=1)).date()
         day, lessons = _get_lessons_for_date(tomorrow_date)
         if day == "Суббота" and not lessons:
@@ -564,39 +559,60 @@ async def inline_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text = _truncate_message(_format_day_table_html(f"Суббота — {label}", prof_lessons))
                 results.append(InlineQueryResultArticle(
                     id=str(uuid.uuid4()),
-                    title=f"Завтра — Суббота ({label})",
-                    input_message_content=InputTextMessageContent(text, parse_mode="HTML")
+                    title=f"{label}",
+                    description=f"Суббота, завтра — {label}",
+                    input_message_content=InputTextMessageContent(text, parse_mode="HTML"),
                 ))
         else:
             text = _truncate_message(_format_day_table_html(day, lessons))
             results.append(InlineQueryResultArticle(
                 id=str(uuid.uuid4()),
-                title=f"Расписание на завтра ({day})",
-                input_message_content=InputTextMessageContent(text, parse_mode="HTML")
+                title=f"Завтра — {day}",
+                input_message_content=InputTextMessageContent(text, parse_mode="HTML"),
             ))
+        await update.inline_query.answer(results, cache_time=0)
+        return
 
-    elif query_text in ["week", "неделя"]:
-        # Пн–Пт одним блоком
+    # ── Уровень 1: неделя ───────────────────────────────────────────────────
+    if query_text in ["неделя", "week"]:
+        # Пн–Пт одним результатом
         week_no_sat = _format_week_text_without_saturday()
         results.append(InlineQueryResultArticle(
             id=str(uuid.uuid4()),
-            title="Неделя (Пн–Пт)",
-            description="Расписание на неделю без субботы",
+            title="Понедельник — Пятница",
+            description="Расписание на неделю (без субботы)",
             input_message_content=InputTextMessageContent(
                 _truncate_message(week_no_sat), parse_mode="HTML"
             ),
         ))
-        # Суббота по профилям — отдельными кнопками
+        # Суббота — отдельный результат или профили
         for sat_result in _get_saturday_inline_results_for_week():
             results.append(sat_result)
+        await update.inline_query.answer(results, cache_time=0)
+        return
 
-    else:
-        results.append(InlineQueryResultArticle(
-            id=str(uuid.uuid4()),
-            title="Введите today, tomorrow или week",
-            input_message_content=InputTextMessageContent("Введите: today / tomorrow / week")
-        ))
+    # ── Уровень 1: суббота (явный запрос профилей) ──────────────────────────
+    if query_text in ["суббота", "saturday"]:
+        for sat_result in _get_saturday_inline_results_for_week():
+            results.append(sat_result)
+        if not results:
+            results.append(InlineQueryResultArticle(
+                id=str(uuid.uuid4()),
+                title="Суббота — нет данных",
+                input_message_content=InputTextMessageContent("Расписание субботы не задано."),
+            ))
+        await update.inline_query.answer(results, cache_time=0)
+        return
 
+    # ── Неизвестный запрос — подсказка ──────────────────────────────────────
+    results.append(InlineQueryResultArticle(
+        id=str(uuid.uuid4()),
+        title="Введите: сегодня / завтра / неделя / суббота",
+        description="или today / tomorrow / week / saturday",
+        input_message_content=InputTextMessageContent(
+            "Доступные запросы: сегодня, завтра, неделя, суббота"
+        ),
+    ))
     await update.inline_query.answer(results, cache_time=0)
 
 # ================== Команда /start ==================
