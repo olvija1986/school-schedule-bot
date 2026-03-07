@@ -685,7 +685,7 @@ async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Готово. Напоминания отключены.")
 
 # ================== Редактирование расписания (/edit_schedule) ==================
-EDIT_MODE, EDIT_CHOOSE_DAY, EDIT_CHOOSE_SATURDAY_PROFILE, EDIT_ENTER_DATE, EDIT_ENTER_LESSONS, EDIT_ENTER_WEEK, EDIT_CONFIRM = range(7)
+EDIT_MODE, EDIT_CHOOSE_DAY, EDIT_CHOOSE_SATURDAY_PROFILE, EDIT_ENTER_DATE, EDIT_ENTER_LESSONS, EDIT_ENTER_WEEK, EDIT_CONFIRM, EDIT_ENTER_SAT_ALL = range(8)
 
 def _day_keyboard() -> InlineKeyboardMarkup:
     rows = []
@@ -717,6 +717,7 @@ def _saturday_profile_keyboard() -> InlineKeyboardMarkup:
             row = []
     if row:
         rows.append(row)
+    rows.append([InlineKeyboardButton("📋 Все профили сразу", callback_data="edit_sat_profile:__ALL__")])
     rows.append([InlineKeyboardButton("Отмена", callback_data="edit_cancel")])
     return InlineKeyboardMarkup(rows)
 
@@ -929,6 +930,56 @@ async def edit_schedule_saturday_profile_chosen(update: Update, context: Context
         return ConversationHandler.END
 
     profile_key = data.split("edit_sat_profile:", 1)[1].strip()
+
+    # ── Режим «все профили сразу» ────────────────────────────────────────────
+    if profile_key == "__ALL__":
+        mode = context.user_data.get("edit_mode", "base")
+        context.user_data["edit_saturday_profile"] = "__ALL__"
+
+        # Собираем текущее расписание всех профилей для превью
+        blocks: list[str] = []
+        if mode == "temp":
+            edit_date = context.user_data.get("edit_date")
+            raw_temp = temp_schedule.get(edit_date) if edit_date else None
+            for key in SATURDAY_PROFILE_KEYS:
+                label = SATURDAY_PROFILE_LABELS[key]
+                if isinstance(raw_temp, dict):
+                    lessons = raw_temp.get(key) or (
+                        schedule.get("Суббота", {}).get(key, [])
+                        if isinstance(schedule.get("Суббота"), dict) else []
+                    )
+                else:
+                    sat = schedule.get("Суббота")
+                    lessons = sat.get(key, []) if isinstance(sat, dict) else []
+                if lessons:
+                    blocks.append(f"Суббота {label}:\n" + "\n".join(lessons))
+            date_label = context.user_data.get("edit_label", "эту субботу")
+            header = f"Текущее расписание субботы для {date_label}"
+        else:
+            sat = schedule.get("Суббота")
+            for key in SATURDAY_PROFILE_KEYS:
+                label = SATURDAY_PROFILE_LABELS[key]
+                lessons = sat.get(key, []) if isinstance(sat, dict) else []
+                if lessons:
+                    blocks.append(f"Суббота {label}:\n" + "\n".join(lessons))
+            header = "Текущее расписание субботы"
+
+        current_text = "\n\n".join(blocks) if blocks else "— (пусто) —"
+        example = (
+            "Суббота Физмат:\n08:30-09:05 Алгебра/211\n09:10-09:45 ...\n\n"
+            "Суббота Инфотех 2 группа:\n08:30-09:05 Алгоритмика/304\n..."
+        )
+        await query.edit_message_text(
+            f"{header}:\n\n{current_text}\n\n"
+            "Пришли новое расписание всех нужных профилей одним сообщением.\n"
+            "Формат:\n"
+            f"{example}\n\n"
+            "Профили которые не укажешь — останутся без изменений.\n"
+            "Отмена — /cancel",
+        )
+        return EDIT_ENTER_SAT_ALL
+
+    # ── Обычный одиночный профиль ────────────────────────────────────────────
     if profile_key not in SATURDAY_PROFILE_KEYS:
         await query.edit_message_text("Некорректный профиль. Попробуй ещё раз: /edit_schedule")
         return ConversationHandler.END
@@ -976,6 +1027,53 @@ def _parse_lessons_from_text(text: str) -> list[str] | None:
     if text.lower() in {"пусто", "нет", "clear"}:
         return []
     return [line.strip() for line in text.splitlines() if line.strip()]
+
+def _parse_saturday_all_profiles(text: str) -> dict[str, list[str]] | None:
+    """Парсит текст вида:
+    Суббота Физмат:
+    08:30-09:05 Алгебра/211
+    ...
+    Суббота Инфотех 2 группа:
+    08:30-09:05 Алгоритмика/304
+    ...
+    Возвращает {profile_key: [уроки]} или None если не распознано ни одного профиля.
+    """
+    lines = (text or "").splitlines()
+    result: dict[str, list[str]] = {}
+    current_key: str | None = None
+
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+
+        # Попытка распознать заголовок профиля: "Суббота <метка>:"
+        matched_key: str | None = None
+        if line.lower().startswith("суббота") and line.endswith(":"):
+            rest = line[7:].strip().rstrip(":").strip()  # всё после "суббота"
+            rest_lower = rest.lower()
+            # Сначала ищем по label
+            for key, label in SATURDAY_PROFILE_LABELS.items():
+                if rest_lower == label.lower():
+                    matched_key = key
+                    break
+            # Потом по ключу напрямую
+            if matched_key is None:
+                for key in SATURDAY_PROFILE_KEYS:
+                    if rest_lower == key.lower():
+                        matched_key = key
+                        break
+
+        if matched_key is not None:
+            current_key = matched_key
+            if current_key not in result:
+                result[current_key] = []
+            continue
+
+        if current_key is not None:
+            result[current_key].append(line)
+
+    return result if result else None
 
 def _parse_week_from_text(text: str) -> dict[str, list[str] | dict[str, list[str]]] | None:
     lines = (text or "").splitlines()
@@ -1200,6 +1298,52 @@ async def edit_schedule_confirm(update: Update, context: ContextTypes.DEFAULT_TY
     mode = context.user_data.get("edit_mode") or "base"
     day = context.user_data.get("edit_day")
 
+    # ── Сохранение всех профилей субботы сразу ──────────────────────────────
+    sat_all = context.user_data.get("edit_sat_all_profiles")
+    if sat_all is not None:
+        if mode == "temp":
+            edit_date = context.user_data.get("edit_date")
+            if not edit_date:
+                await query.edit_message_text("Сессия редактирования потеряна. Запусти заново: /edit_schedule")
+                return ConversationHandler.END
+            existing = temp_schedule.get(edit_date)
+            if not isinstance(existing, dict):
+                existing = {}
+            existing.update(sat_all)
+            temp_schedule[edit_date] = existing
+            try:
+                _save_temp_schedule_to_disk()
+            except Exception as e:
+                await query.edit_message_text(f"Не удалось сохранить: {e}")
+                return ConversationHandler.END
+            date_label = context.user_data.get("edit_label") or edit_date
+            labels_str = ", ".join(SATURDAY_PROFILE_LABELS.get(k, k) for k in sat_all)
+            notify_parts = [
+                _format_day_table_html(f"Суббота — {SATURDAY_PROFILE_LABELS.get(k, k)}", v)
+                for k, v in sat_all.items()
+            ]
+            msg = _truncate_message(f"📢 Временное расписание субботы обновлено ({date_label}):\n\n" + "\n\n".join(notify_parts))
+            asyncio.create_task(_notify_subscribers(msg))
+            await query.edit_message_text(f"Готово! Обновлены профили для {date_label}: {labels_str}.")
+        else:
+            if not isinstance(schedule.get("Суббота"), dict):
+                schedule["Суббота"] = {}
+            schedule["Суббота"].update(sat_all)
+            try:
+                _save_schedule_to_disk()
+            except Exception as e:
+                await query.edit_message_text(f"Не удалось сохранить: {e}")
+                return ConversationHandler.END
+            labels_str = ", ".join(SATURDAY_PROFILE_LABELS.get(k, k) for k in sat_all)
+            notify_parts = [
+                _format_day_table_html(f"Суббота — {SATURDAY_PROFILE_LABELS.get(k, k)}", v)
+                for k, v in sat_all.items()
+            ]
+            msg = _truncate_message("📢 Обновлено расписание субботы:\n\n" + "\n\n".join(notify_parts))
+            asyncio.create_task(_notify_subscribers(msg))
+            await query.edit_message_text(f"Готово! Обновлены профили субботы: {labels_str}.")
+        return ConversationHandler.END
+
     if mode == "base" and day == "__WEEK__":
         week = context.user_data.get("edit_week")
         if not isinstance(week, dict):
@@ -1296,6 +1440,43 @@ async def edit_schedule_confirm(update: Update, context: ContextTypes.DEFAULT_TY
     await query.edit_message_text(f"Готово! Расписание для «{label}» обновлено.")
     return ConversationHandler.END
 
+async def edit_schedule_sat_all_entered(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получаем текст со всеми профилями субботы сразу."""
+    if not _is_admin(update):
+        await update.message.reply_text("У вас нет прав на редактирование расписания.")
+        return ConversationHandler.END
+
+    profiles = _parse_saturday_all_profiles(update.message.text or "")
+    if not profiles:
+        await update.message.reply_text(
+            "Не удалось распознать профили.\n"
+            "Используй формат:\n"
+            "Суббота Физмат:\n08:30-09:05 Алгебра/211\n...\n\n"
+            "Суббота Инфотех 2 группа:\n08:30-09:05 Алгоритмика/304\n..."
+        )
+        return EDIT_ENTER_SAT_ALL
+
+    context.user_data["edit_sat_all_profiles"] = profiles
+
+    # Превью
+    blocks = []
+    for key, lessons in profiles.items():
+        label = SATURDAY_PROFILE_LABELS.get(key, key)
+        lessons_text = "\n".join(lessons) if lessons else "— (пусто) —"
+        blocks.append(f"<b>Суббота — {html.escape(label)}</b>\n{html.escape(lessons_text)}")
+    preview = "\n\n".join(blocks)
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Сохранить", callback_data="edit_confirm"),
+        InlineKeyboardButton("❌ Отмена", callback_data="edit_cancel"),
+    ]])
+    await update.message.reply_text(
+        f"Проверь расписание субботы:\n\n{preview}",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
+    return EDIT_CONFIRM
+
 async def edit_schedule_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         await update.message.reply_text("Ок, отменил.")
@@ -1326,6 +1507,9 @@ edit_conv = ConversationHandler(
         ],
         EDIT_ENTER_WEEK: [
             MessageHandler(filters.TEXT & ~filters.COMMAND, edit_schedule_week_entered)
+        ],
+        EDIT_ENTER_SAT_ALL: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, edit_schedule_sat_all_entered)
         ],
         EDIT_CONFIRM: [CallbackQueryHandler(edit_schedule_confirm, pattern=r"^edit_")],
     },
