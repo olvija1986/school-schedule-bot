@@ -120,6 +120,26 @@ def _save_subscriptions_to_disk() -> None:
         f.write("\n")
     os.replace(tmp_path, SUBSCRIPTIONS_PATH)
 
+async def _notify_subscribers(text: str, parse_mode: str = "HTML") -> None:
+    """Отправляет сообщение всем подписчикам (напоминаний)."""
+    if not subscriptions:
+        return
+    chat_ids = set()
+    for entry in subscriptions.values():
+        cid = entry.get("chat_id")
+        if cid is not None:
+            chat_ids.add(int(cid))
+    for chat_id in chat_ids:
+        try:
+            await bot_app.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=parse_mode,
+            )
+            await asyncio.sleep(0.05)  # небольшая пауза, чтобы не упереться в лимиты
+        except Exception:
+            pass  # пользователь мог заблокировать бота — пропускаем
+
 def _is_admin(update: Update) -> bool:
     if not ADMIN_USER_IDS:
         # Если админы не настроены — разрешаем всем (удобно для личного бота)
@@ -918,6 +938,15 @@ async def edit_schedule_confirm(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(f"Не удалось сохранить расписание: {e}")
             return ConversationHandler.END
 
+        # Уведомляем подписчиков
+        week_text = "\n\n".join(
+            _format_day_table_html(d, schedule.get(d, []))
+            for d in SCHEDULE_DAYS
+            if d in schedule
+        ) or _format_day_table_html("Неделя", [])
+        week_text = _truncate_message("📢 Обновлено расписание на неделю:\n\n" + week_text)
+        asyncio.create_task(_notify_subscribers(week_text))
+
         await query.edit_message_text("Готово! Расписание на неделю обновлено.")
         return ConversationHandler.END
 
@@ -941,6 +970,10 @@ async def edit_schedule_confirm(update: Update, context: ContextTypes.DEFAULT_TY
             return ConversationHandler.END
 
         label = context.user_data.get("edit_label") or edit_date
+        # Уведомляем подписчиков
+        msg = "📢 Временное расписание обновлено:\n\n" + _format_day_table_html(label, lessons)
+        asyncio.create_task(_notify_subscribers(msg))
+
         await query.edit_message_text(f"Готово! Временное расписание для «{label}» обновлено.")
         return ConversationHandler.END
 
@@ -955,6 +988,10 @@ async def edit_schedule_confirm(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         await query.edit_message_text(f"Не удалось сохранить расписание: {e}")
         return ConversationHandler.END
+
+    # Уведомляем подписчиков
+    msg = "📢 Обновлено расписание:\n\n" + _format_day_table_html(day, lessons)
+    asyncio.create_task(_notify_subscribers(msg))
 
     await query.edit_message_text(f"Готово! Расписание для «{day}» обновлено.")
     return ConversationHandler.END
