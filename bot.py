@@ -79,10 +79,10 @@ SATURDAY_PROFILES: list[tuple[str, str]] = [
     ("Соцгум", "Соцгум"),
     ("Инфотех_1", "Инфотех 1 группа"),
     ("Инфотех_2", "Инфотех 2 группа"),
-    ("Общеобр-ый_1", "Общеобр-ый 1 группа"),
-    ("Общеобр-ый_2", "Общеобр-ый 2 группа"),
-    ("Общеобр-ый_3", "Общеобр-ый 3 группа"),
-    ("Общеобр-ый_4", "Общеобр-ый 4 группа"),
+    ("Общеобразовательный_1", "Общеобр-ый 1 группа"),
+    ("Общеобразовательный_2", "Общеобр-ый 2 группа"),
+    ("Общеобразовательный_3", "Общеобр-ый 3 группа"),
+    ("Общеобразовательный_4", "Общеобр-ый 4 группа"),
 ]
 SATURDAY_PROFILE_KEYS = [k for k, _ in SATURDAY_PROFILES]
 SATURDAY_PROFILE_LABELS = {k: label for k, label in SATURDAY_PROFILES}
@@ -104,17 +104,30 @@ def _saturday_data_to_profiles(day_data: list | dict | None) -> list[tuple[str, 
     return []
 
 def _get_saturday_profiles_for_date(d: date) -> list[tuple[str, list[str]]]:
-    """Расписание субботы по профилям на дату d (с учётом temp_schedule)."""
+    """Расписание субботы по профилям на дату d (с учётом temp_schedule).
+    Если temp_schedule[date] — dict, мёржим с основным: temp перекрывает только
+    те профили которые в нём есть, остальные берутся из schedule.
+    Если temp_schedule[date] — list, используем его целиком (legacy).
+    """
     key = d.isoformat()
+    base_sat = schedule.get("Суббота")
+
     if key in temp_schedule:
         raw = temp_schedule[key]
-        if isinstance(raw, dict):
-            return _saturday_data_to_profiles(raw)
         if isinstance(raw, list):
             return [("Суббота", raw)]
+        if isinstance(raw, dict):
+            # Мёржим: для каждого профиля берём temp если есть, иначе base
+            merged: dict[str, list[str]] = {}
+            for pk in SATURDAY_PROFILE_KEYS:
+                if pk in raw:
+                    merged[pk] = raw[pk]
+                elif isinstance(base_sat, dict) and pk in base_sat:
+                    merged[pk] = base_sat[pk]
+            return _saturday_data_to_profiles(merged)
         return []
-    sat = schedule.get("Суббота")
-    return _saturday_data_to_profiles(sat)
+
+    return _saturday_data_to_profiles(base_sat)
 
 _LESSON_RE = re.compile(
     r"^\s*(?P<start>\d{1,2}:\d{2})\s*-\s*(?P<end>\d{1,2}:\d{2})\s+(?P<rest>.+?)\s*$"
@@ -1299,7 +1312,7 @@ async def edit_schedule_confirm(update: Update, context: ContextTypes.DEFAULT_TY
     day = context.user_data.get("edit_day")
 
     # ── Сохранение всех профилей субботы сразу ──────────────────────────────
-    sat_all = context.user_data.get("edit_sat_all_profiles")
+    sat_all = context.user_data.pop("edit_sat_all_profiles", None)
     if sat_all is not None:
         if mode == "temp":
             edit_date = context.user_data.get("edit_date")
@@ -1383,7 +1396,7 @@ async def edit_schedule_confirm(update: Update, context: ContextTypes.DEFAULT_TY
             return ConversationHandler.END
 
         profile_key = context.user_data.get("edit_saturday_profile")
-        if profile_key:
+        if profile_key and profile_key in SATURDAY_PROFILE_KEYS:
             # Суббота по профилям — сохраняем как dict, не затирая другие профили
             existing = temp_schedule.get(edit_date)
             if not isinstance(existing, dict):
@@ -1417,7 +1430,7 @@ async def edit_schedule_confirm(update: Update, context: ContextTypes.DEFAULT_TY
 
     if day == "Суббота":
         profile_key = context.user_data.get("edit_saturday_profile")
-        if not profile_key:
+        if not profile_key or profile_key not in SATURDAY_PROFILE_KEYS:
             await query.edit_message_text("Сессия редактирования потеряна. Запусти заново: /edit_schedule")
             return ConversationHandler.END
         if not isinstance(schedule.get("Суббота"), dict):
