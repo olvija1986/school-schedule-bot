@@ -308,50 +308,84 @@ def _reschedule_user(user_id: int):
         coalesce=True,
     )
 
+# Лимит Telegram для текста сообщения
+_MAX_MESSAGE_LEN = 4096
+
+def _truncate_message(text: str, max_len: int = _MAX_MESSAGE_LEN - 100) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3].rstrip() + "…"
+
 # ================== Inline-запрос ==================
 async def inline_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.inline_query.query.lower().strip()
+    query = (update.inline_query.query or "").lower().strip()
     if not query:
         # Подсказки, когда пользователь только открыл inline-режим
-        now = datetime.now(tz=_get_tz())
-        today_day, today_lessons = _get_lessons_for_date(now.date())
-        tomorrow_day, tomorrow_lessons = _get_lessons_for_date((now + timedelta(days=1)).date())
+        try:
+            now = datetime.now(tz=_get_tz())
+            today_day, today_lessons = _get_lessons_for_date(now.date())
+            tomorrow_day, tomorrow_lessons = _get_lessons_for_date((now + timedelta(days=1)).date())
 
-        results = [
-            InlineQueryResultArticle(
-                id=str(uuid.uuid4()),
-                title=f"Сегодня ({today_day})",
-                description="Подсказка: запрос today / сегодня",
-                input_message_content=InputTextMessageContent(
-                    _format_day_table_html(today_day, today_lessons),
-                    parse_mode="HTML",
+            week_text = "\n\n".join(
+                _format_day_table_html(day, schedule.get(day, []))
+                for day in SCHEDULE_DAYS
+                if day in schedule
+            ) or _format_day_table_html("Неделя", [])
+            week_text = _truncate_message(week_text)
+
+            results = [
+                InlineQueryResultArticle(
+                    id=str(uuid.uuid4()),
+                    title=f"Сегодня ({today_day})",
+                    description="Подсказка: запрос today / сегодня",
+                    input_message_content=InputTextMessageContent(
+                        _format_day_table_html(today_day, today_lessons),
+                        parse_mode="HTML",
+                    ),
                 ),
-            ),
-            InlineQueryResultArticle(
-                id=str(uuid.uuid4()),
-                title=f"Завтра ({tomorrow_day})",
-                description="Подсказка: запрос tomorrow / завтра",
-                input_message_content=InputTextMessageContent(
-                    _format_day_table_html(tomorrow_day, tomorrow_lessons),
-                    parse_mode="HTML",
+                InlineQueryResultArticle(
+                    id=str(uuid.uuid4()),
+                    title=f"Завтра ({tomorrow_day})",
+                    description="Подсказка: запрос tomorrow / завтра",
+                    input_message_content=InputTextMessageContent(
+                        _format_day_table_html(tomorrow_day, tomorrow_lessons),
+                        parse_mode="HTML",
+                    ),
                 ),
-            ),
-            InlineQueryResultArticle(
-                id=str(uuid.uuid4()),
-                title="Неделя",
-                description="Подсказка: запрос week / неделя",
-                input_message_content=InputTextMessageContent(
-                    "\n\n".join(
-                        _format_day_table_html(day, schedule.get(day, []))
-                        for day in SCHEDULE_DAYS
-                        if day in schedule
-                    )
-                    or _format_day_table_html("Неделя", []),
-                    parse_mode="HTML",
+                InlineQueryResultArticle(
+                    id=str(uuid.uuid4()),
+                    title="Неделя",
+                    description="Подсказка: запрос week / неделя",
+                    input_message_content=InputTextMessageContent(
+                        week_text,
+                        parse_mode="HTML",
+                    ),
                 ),
-            ),
-        ]
-        await update.inline_query.answer(results, cache_time=0)
+            ]
+            await update.inline_query.answer(results, cache_time=0)
+        except Exception as e:
+            # Fallback, чтобы хоть что-то показать при ошибке
+            results = [
+                InlineQueryResultArticle(
+                    id=str(uuid.uuid4()),
+                    title="today — расписание на сегодня",
+                    description="",
+                    input_message_content=InputTextMessageContent("Введите: today / tomorrow / week"),
+                ),
+                InlineQueryResultArticle(
+                    id=str(uuid.uuid4()),
+                    title="tomorrow — расписание на завтра",
+                    description="",
+                    input_message_content=InputTextMessageContent("Введите: today / tomorrow / week"),
+                ),
+                InlineQueryResultArticle(
+                    id=str(uuid.uuid4()),
+                    title="week — расписание на неделю",
+                    description="",
+                    input_message_content=InputTextMessageContent("Введите: today / tomorrow / week"),
+                ),
+            ]
+            await update.inline_query.answer(results, cache_time=0)
         return
 
     results = []
