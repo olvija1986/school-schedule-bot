@@ -188,13 +188,12 @@ async def _notify_subscribers(text: str, parse_mode: str = "HTML") -> None:
                 text=text,
                 parse_mode=parse_mode,
             )
-            await asyncio.sleep(0.05)  # небольшая пауза, чтобы не упереться в лимиты
+            await asyncio.sleep(0.05)
         except Exception:
-            pass  # пользователь мог заблокировать бота — пропускаем
+            pass
 
 def _is_admin(update: Update) -> bool:
     if not ADMIN_USER_IDS:
-        # Если админы не настроены — разрешаем всем (удобно для личного бота)
         return True
     user = update.effective_user
     return bool(user and user.id in ADMIN_USER_IDS)
@@ -253,7 +252,6 @@ def _format_day_table_html(day: str, lessons: list[str]) -> str:
             }
         )
 
-    # ширины колонок (чтобы не разъезжалось в Telegram)
     n_w = max(1, min(2, max((len(r["n"]) for r in rows), default=1)))
     start_w = 5
     end_w = 5
@@ -297,8 +295,6 @@ def _format_day_table_html(day: str, lessons: list[str]) -> str:
     return f"<b>{html.escape(day)}</b>\n<pre>{pre}</pre>"
 
 def _get_tz() -> ZoneInfo:
-    # Можно переопределить в Render: TZ=Etc/GMT-5 (UTC+5) или любая IANA TZ
-    # Важно: у Etc/GMT-5 "минус" означает UTC+5 (так устроена зона Etc/*)
     name = (os.environ.get("TZ") or "Etc/GMT-5").strip()
     try:
         return ZoneInfo(name)
@@ -329,8 +325,7 @@ def _parse_hhmm(s: str) -> tuple[int, int] | None:
     return h, mi
 
 def _get_lessons_for_date(d: date) -> tuple[str, list[str]]:
-    """Возвращает (название_дня_по-русски, список_уроков) с учётом временного расписания.
-    Для субботы по профилям возвращает (Суббота, []); смотреть _get_saturday_profiles_for_date."""
+    """Возвращает (название_дня_по-русски, список_уроков) с учётом временного расписания."""
     key = d.isoformat()
     day_eng = d.strftime("%A")
     day_ru = DAY_MAP.get(day_eng, day_eng)
@@ -354,7 +349,6 @@ def _get_lessons_for_date(d: date) -> tuple[str, list[str]]:
     return day_ru, schedule.get(day_ru, [])
 
 async def _send_daily_reminder(chat_id: int):
-    # Расписание на сегодня (с учётом временных замен и профилей в субботу)
     today = datetime.now(tz=_get_tz()).date()
     day_eng = today.strftime("%A")
     day_ru = DAY_MAP.get(day_eng, day_eng)
@@ -398,11 +392,10 @@ def _reschedule_user(user_id: int):
         args=[chat_id],
         id=job_id,
         replace_existing=True,
-        misfire_grace_time=3600,  # если сервис был оффлайн, попытаться догнать в течение часа
+        misfire_grace_time=3600,
         coalesce=True,
     )
 
-# Лимит Telegram для текста сообщения
 _MAX_MESSAGE_LEN = 4096
 
 def _truncate_message(text: str, max_len: int = _MAX_MESSAGE_LEN - 100) -> str:
@@ -428,142 +421,174 @@ def _format_week_text() -> str:
             blocks.append(_format_day_table_html(day, data))
     return "\n\n".join(blocks) if blocks else _format_day_table_html("Неделя", [])
 
+def _format_week_text_without_saturday() -> str:
+    """Текст расписания на неделю без субботы (для inline — суббота отдельными кнопками)."""
+    blocks: list[str] = []
+    for day in SCHEDULE_DAYS:
+        if day == "Суббота":
+            continue
+        if day not in schedule:
+            continue
+        data = schedule[day]
+        if isinstance(data, list) and data:
+            blocks.append(_format_day_table_html(day, data))
+    return "\n\n".join(blocks) if blocks else _format_day_table_html("Неделя", [])
+
+def _get_saturday_inline_results_for_week() -> list[InlineQueryResultArticle]:
+    """Создаёт отдельный результат для каждого профиля субботы (для inline-запроса week)."""
+    results = []
+    sat_data = schedule.get("Суббота")
+    if sat_data is None:
+        return results
+
+    if isinstance(sat_data, list) and sat_data:
+        text = _truncate_message(_format_day_table_html("Суббота", sat_data))
+        results.append(InlineQueryResultArticle(
+            id=str(uuid.uuid4()),
+            title="Суббота",
+            description="Расписание субботы",
+            input_message_content=InputTextMessageContent(text, parse_mode="HTML"),
+        ))
+    elif isinstance(sat_data, dict):
+        for key in SATURDAY_PROFILE_KEYS:
+            if key in sat_data and sat_data[key]:
+                label = SATURDAY_PROFILE_LABELS.get(key, key)
+                text = _truncate_message(_format_day_table_html(f"Суббота — {label}", sat_data[key]))
+                results.append(InlineQueryResultArticle(
+                    id=str(uuid.uuid4()),
+                    title=f"Суббота — {label}",
+                    description="Расписание субботы по профилю",
+                    input_message_content=InputTextMessageContent(text, parse_mode="HTML"),
+                ))
+    return results
+
 # ================== Inline-запрос ==================
 async def inline_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = (update.inline_query.query or "").lower().strip()
-    if not query:
-        # Подсказки, когда пользователь только открыл inline-режим
-        try:
-            now = datetime.now(tz=_get_tz())
-            today_day, today_lessons = _get_lessons_for_date(now.date())
-            tomorrow_day, tomorrow_lessons = _get_lessons_for_date((now + timedelta(days=1)).date())
+    query_text = (update.inline_query.query or "").lower().strip()
+    now = datetime.now(tz=_get_tz())
 
-            results = []
-            # Сегодня
-            if today_day == "Суббота" and not today_lessons:
-                for label, lessons in _get_saturday_profiles_for_date(now.date()):
-                    results.append(InlineQueryResultArticle(
-                        id=str(uuid.uuid4()),
-                        title=f"Сегодня — Суббота ({label})",
-                        description="Подсказка: today / сегодня",
-                        input_message_content=InputTextMessageContent(
-                            _format_day_table_html(f"Суббота — {label}", lessons),
-                            parse_mode="HTML",
-                        ),
-                    ))
-            else:
+    if not query_text:
+        # Подсказки, когда пользователь только открыл inline-режим
+        results = []
+
+        # Сегодня
+        today_day, today_lessons = _get_lessons_for_date(now.date())
+        if today_day == "Суббота" and not today_lessons:
+            for label, lessons in _get_saturday_profiles_for_date(now.date()):
                 results.append(InlineQueryResultArticle(
                     id=str(uuid.uuid4()),
-                    title=f"Сегодня ({today_day})",
-                    description="Подсказка: запрос today / сегодня",
+                    title=f"Сегодня — Суббота ({label})",
+                    description="Подсказка: today / сегодня",
                     input_message_content=InputTextMessageContent(
-                        _format_day_table_html(today_day, today_lessons),
+                        _truncate_message(_format_day_table_html(f"Суббота — {label}", lessons)),
                         parse_mode="HTML",
                     ),
                 ))
-            # Завтра
-            if tomorrow_day == "Суббота" and not tomorrow_lessons:
-                for label, lessons in _get_saturday_profiles_for_date((now + timedelta(days=1)).date()):
-                    results.append(InlineQueryResultArticle(
-                        id=str(uuid.uuid4()),
-                        title=f"Завтра — Суббота ({label})",
-                        description="Подсказка: tomorrow / завтра",
-                        input_message_content=InputTextMessageContent(
-                            _format_day_table_html(f"Суббота — {label}", lessons),
-                            parse_mode="HTML",
-                        ),
-                    ))
-            else:
-                results.append(InlineQueryResultArticle(
-                    id=str(uuid.uuid4()),
-                    title=f"Завтра ({tomorrow_day})",
-                    description="Подсказка: запрос tomorrow / завтра",
-                    input_message_content=InputTextMessageContent(
-                        _format_day_table_html(tomorrow_day, tomorrow_lessons),
-                        parse_mode="HTML",
-                    ),
-                ))
-            # Неделя
-            week_text = _truncate_message(_format_week_text())
+        else:
             results.append(InlineQueryResultArticle(
                 id=str(uuid.uuid4()),
-                title="Неделя",
-                description="Подсказка: запрос week / неделя",
-                input_message_content=InputTextMessageContent(week_text, parse_mode="HTML"),
+                title=f"Сегодня ({today_day})",
+                description="Подсказка: запрос today / сегодня",
+                input_message_content=InputTextMessageContent(
+                    _truncate_message(_format_day_table_html(today_day, today_lessons)),
+                    parse_mode="HTML",
+                ),
             ))
-            await update.inline_query.answer(results, cache_time=0)
-        except Exception as e:
-            # Fallback, чтобы хоть что-то показать при ошибке
-            results = [
-                InlineQueryResultArticle(
+
+        # Завтра
+        tomorrow_date = (now + timedelta(days=1)).date()
+        tomorrow_day, tomorrow_lessons = _get_lessons_for_date(tomorrow_date)
+        if tomorrow_day == "Суббота" and not tomorrow_lessons:
+            for label, lessons in _get_saturday_profiles_for_date(tomorrow_date):
+                results.append(InlineQueryResultArticle(
                     id=str(uuid.uuid4()),
-                    title="today — расписание на сегодня",
-                    description="",
-                    input_message_content=InputTextMessageContent("Введите: today / tomorrow / week"),
+                    title=f"Завтра — Суббота ({label})",
+                    description="Подсказка: tomorrow / завтра",
+                    input_message_content=InputTextMessageContent(
+                        _truncate_message(_format_day_table_html(f"Суббота — {label}", lessons)),
+                        parse_mode="HTML",
+                    ),
+                ))
+        else:
+            results.append(InlineQueryResultArticle(
+                id=str(uuid.uuid4()),
+                title=f"Завтра ({tomorrow_day})",
+                description="Подсказка: запрос tomorrow / завтра",
+                input_message_content=InputTextMessageContent(
+                    _truncate_message(_format_day_table_html(tomorrow_day, tomorrow_lessons)),
+                    parse_mode="HTML",
                 ),
-                InlineQueryResultArticle(
-                    id=str(uuid.uuid4()),
-                    title="tomorrow — расписание на завтра",
-                    description="",
-                    input_message_content=InputTextMessageContent("Введите: today / tomorrow / week"),
-                ),
-                InlineQueryResultArticle(
-                    id=str(uuid.uuid4()),
-                    title="week — расписание на неделю",
-                    description="",
-                    input_message_content=InputTextMessageContent("Введите: today / tomorrow / week"),
-                ),
-            ]
-            await update.inline_query.answer(results, cache_time=0)
+            ))
+
+        # Неделя (без субботы) + суббота по профилям
+        week_no_sat = _format_week_text_without_saturday()
+        results.append(InlineQueryResultArticle(
+            id=str(uuid.uuid4()),
+            title="Неделя (Пн–Пт)",
+            description="Расписание на неделю без субботы",
+            input_message_content=InputTextMessageContent(
+                _truncate_message(week_no_sat), parse_mode="HTML"
+            ),
+        ))
+        for sat_result in _get_saturday_inline_results_for_week():
+            results.append(sat_result)
+
+        await update.inline_query.answer(results, cache_time=0)
         return
 
     results = []
 
-    if query in ["today", "сегодня"]:
-        now = datetime.now(tz=_get_tz())
+    if query_text in ["today", "сегодня"]:
         day, lessons = _get_lessons_for_date(now.date())
         if day == "Суббота" and not lessons:
             for label, prof_lessons in _get_saturday_profiles_for_date(now.date()):
-                text = _format_day_table_html(f"Суббота — {label}", prof_lessons)
+                text = _truncate_message(_format_day_table_html(f"Суббота — {label}", prof_lessons))
                 results.append(InlineQueryResultArticle(
                     id=str(uuid.uuid4()),
                     title=f"Сегодня — Суббота ({label})",
                     input_message_content=InputTextMessageContent(text, parse_mode="HTML")
                 ))
         else:
-            text = _format_day_table_html(day, lessons)
+            text = _truncate_message(_format_day_table_html(day, lessons))
             results.append(InlineQueryResultArticle(
                 id=str(uuid.uuid4()),
                 title=f"Расписание на сегодня ({day})",
                 input_message_content=InputTextMessageContent(text, parse_mode="HTML")
             ))
 
-    elif query in ["tomorrow", "завтра"]:
-        now = datetime.now(tz=_get_tz())
-        day, lessons = _get_lessons_for_date((now + timedelta(days=1)).date())
+    elif query_text in ["tomorrow", "завтра"]:
+        tomorrow_date = (now + timedelta(days=1)).date()
+        day, lessons = _get_lessons_for_date(tomorrow_date)
         if day == "Суббота" and not lessons:
-            for label, prof_lessons in _get_saturday_profiles_for_date((now + timedelta(days=1)).date()):
-                text = _format_day_table_html(f"Суббота — {label}", prof_lessons)
+            for label, prof_lessons in _get_saturday_profiles_for_date(tomorrow_date):
+                text = _truncate_message(_format_day_table_html(f"Суббота — {label}", prof_lessons))
                 results.append(InlineQueryResultArticle(
                     id=str(uuid.uuid4()),
                     title=f"Завтра — Суббота ({label})",
                     input_message_content=InputTextMessageContent(text, parse_mode="HTML")
                 ))
         else:
-            text = _format_day_table_html(day, lessons)
+            text = _truncate_message(_format_day_table_html(day, lessons))
             results.append(InlineQueryResultArticle(
                 id=str(uuid.uuid4()),
                 title=f"Расписание на завтра ({day})",
                 input_message_content=InputTextMessageContent(text, parse_mode="HTML")
             ))
 
-    elif query in ["week", "неделя"]:
-        text = _format_week_text()
+    elif query_text in ["week", "неделя"]:
+        # Пн–Пт одним блоком
+        week_no_sat = _format_week_text_without_saturday()
         results.append(InlineQueryResultArticle(
             id=str(uuid.uuid4()),
-            title="Расписание на неделю",
-            input_message_content=InputTextMessageContent(text.strip(), parse_mode="HTML")
+            title="Неделя (Пн–Пт)",
+            description="Расписание на неделю без субботы",
+            input_message_content=InputTextMessageContent(
+                _truncate_message(week_no_sat), parse_mode="HTML"
+            ),
         ))
+        # Суббота по профилям — отдельными кнопками
+        for sat_result in _get_saturday_inline_results_for_week():
+            results.append(sat_result)
 
     else:
         results.append(InlineQueryResultArticle(
@@ -638,9 +663,6 @@ async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Готово. Напоминания отключены.")
 
 # ================== Редактирование расписания (/edit_schedule) ==================
-# EDIT_ENTER_WEEK — редактируем сразу расписание на всю неделю одним сообщением
-# EDIT_MODE / EDIT_ENTER_DATE — выбор типа (основное/временное) и даты для временного
-# EDIT_CHOOSE_SATURDAY_PROFILE — выбор профиля для субботы
 EDIT_MODE, EDIT_CHOOSE_DAY, EDIT_CHOOSE_SATURDAY_PROFILE, EDIT_ENTER_DATE, EDIT_ENTER_LESSONS, EDIT_ENTER_WEEK, EDIT_CONFIRM = range(7)
 
 def _day_keyboard() -> InlineKeyboardMarkup:
@@ -653,7 +675,6 @@ def _day_keyboard() -> InlineKeyboardMarkup:
             row = []
     if row:
         rows.append(row)
-    # Отдельная кнопка для редактирования сразу всей недели
     rows.append(
         [
             InlineKeyboardButton(
@@ -665,7 +686,6 @@ def _day_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 def _saturday_profile_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура выбора профиля для субботы."""
     rows = []
     row = []
     for key, label in SATURDAY_PROFILES:
@@ -761,7 +781,6 @@ async def edit_schedule_date_entered(update: Update, context: ContextTypes.DEFAU
     context.user_data["edit_label"] = f"{d.strftime('%d.%m.%Y')} ({day_ru})"
     context.user_data["edit_mode"] = "temp"
 
-    # Берём временное расписание, если уже есть; иначе копию основного на этот день
     if key in temp_schedule:
         lessons = temp_schedule[key]
         if isinstance(lessons, dict):
@@ -803,24 +822,22 @@ async def edit_schedule_day_chosen(update: Update, context: ContextTypes.DEFAULT
     mode = context.user_data.get("edit_mode") or "base"
     context.user_data["edit_mode"] = mode
 
-    # Особый режим — редактирование сразу всей недели
     if day_code == "__WEEK__":
         context.user_data["edit_day"] = "__WEEK__"
 
-        # Собираем текущую неделю в удобный для редактирования текст
         blocks = []
         for d in SCHEDULE_DAYS:
-            data = schedule.get(d)
-            if d == "Суббота" and isinstance(data, dict):
+            day_data = schedule.get(d)
+            if d == "Суббота" and isinstance(day_data, dict):
                 for pk in SATURDAY_PROFILE_KEYS:
-                    if pk in data and data[pk]:
+                    if pk in day_data and day_data[pk]:
                         label = SATURDAY_PROFILE_LABELS.get(pk, pk)
                         block = [f"Суббота {label}:"]
-                        block.extend(data[pk])
+                        block.extend(day_data[pk])
                         blocks.append("\n".join(block))
-            elif isinstance(data, list):
+            elif isinstance(day_data, list):
                 block = [f"{d}:"]
-                block.extend(data or ["(нет занятий)"])
+                block.extend(day_data or ["(нет занятий)"])
                 blocks.append("\n".join(block))
         current_text = "\n\n".join(blocks)
 
@@ -839,14 +856,12 @@ async def edit_schedule_day_chosen(update: Update, context: ContextTypes.DEFAULT
         )
         return EDIT_ENTER_WEEK
 
-    # Обычный режим — редактируем один день недели
     if day_code not in SCHEDULE_DAYS:
         await query.edit_message_text("Некорректный день. Попробуй ещё раз: /edit_schedule")
         return ConversationHandler.END
 
     context.user_data["edit_day"] = day_code
 
-    # Суббота: сначала выбор профиля
     if day_code == "Суббота":
         await query.edit_message_text(
             "Выбери профиль для редактирования расписания в субботу.",
@@ -870,7 +885,6 @@ async def edit_schedule_day_chosen(update: Update, context: ContextTypes.DEFAULT
     return EDIT_ENTER_LESSONS
 
 async def edit_schedule_saturday_profile_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Выбран профиль субботы — переходим к вводу уроков для этого профиля."""
     query = update.callback_query
     await query.answer()
 
@@ -919,16 +933,6 @@ def _parse_lessons_from_text(text: str) -> list[str] | None:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 def _parse_week_from_text(text: str) -> dict[str, list[str] | dict[str, list[str]]] | None:
-    """
-    Разбирает текст вида:
-    Понедельник:
-    ...
-    Суббота Физмат:
-    ...
-    Суббота Биохим:
-    ...
-    Возвращает {день: [уроки]} или для Субботы {Суббота: {profile_key: [уроки]}}.
-    """
     lines = (text or "").splitlines()
     current_day: str | None = None
     current_saturday_profile: str | None = None
@@ -940,10 +944,9 @@ def _parse_week_from_text(text: str) -> dict[str, list[str] | dict[str, list[str
         if not line:
             continue
 
-        # Суббота по профилю: "Суббота Физмат:" или "Суббота Инфотех 1 группа:"
         if line.lower().startswith("суббота ") and ":" in line:
             prefix, _ = line.split(":", 1)
-            rest = prefix[8:].strip().lower()  # после "Суббота "
+            rest = prefix[8:].strip().lower()
             matched_key = None
             for key, label in SATURDAY_PROFILE_LABELS.items():
                 if rest == label.lower():
@@ -958,7 +961,6 @@ def _parse_week_from_text(text: str) -> dict[str, list[str] | dict[str, list[str
                 result["Суббота"][matched_key] = []
                 continue
 
-        # Обычный день или "Суббота:" (один блок)
         matched_day = None
         for d in SCHEDULE_DAYS:
             if line.lower() == (d.lower() + ":") or line.lower().startswith(d.lower() + ":"):
@@ -1033,7 +1035,6 @@ async def edit_schedule_lessons_entered(update: Update, context: ContextTypes.DE
     return EDIT_CONFIRM
 
 async def edit_schedule_lessons_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /set для групп с privacy mode (обычные сообщения могут не доходить)."""
     if not _is_admin(update):
         await update.message.reply_text("У вас нет прав на редактирование расписания.")
         return ConversationHandler.END
@@ -1066,7 +1067,6 @@ async def edit_schedule_lessons_command(update: Update, context: ContextTypes.DE
         )
         return EDIT_ENTER_LESSONS
 
-    # Переиспользуем общий шаг предпросмотра/подтверждения
     context.user_data["edit_lessons"] = lessons
     if context.user_data.get("edit_saturday_profile"):
         pk = context.user_data["edit_saturday_profile"]
@@ -1110,7 +1110,6 @@ async def edit_schedule_week_entered(update: Update, context: ContextTypes.DEFAU
 
     context.user_data["edit_week"] = week
 
-    # Превью
     blocks = []
     for d in SCHEDULE_DAYS:
         lessons = week.get(d, [])
@@ -1156,7 +1155,6 @@ async def edit_schedule_confirm(update: Update, context: ContextTypes.DEFAULT_TY
     mode = context.user_data.get("edit_mode") or "base"
     day = context.user_data.get("edit_day")
 
-    # Сохранение недели целиком (меняем только основное расписание)
     if mode == "base" and day == "__WEEK__":
         week = context.user_data.get("edit_week")
         if not isinstance(week, dict):
@@ -1173,7 +1171,6 @@ async def edit_schedule_confirm(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text(f"Не удалось сохранить расписание: {e}")
             return ConversationHandler.END
 
-        # Уведомляем подписчиков
         week_text = "\n\n".join(
             _format_day_table_html(d, schedule.get(d, []))
             for d in SCHEDULE_DAYS
@@ -1185,7 +1182,6 @@ async def edit_schedule_confirm(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("Готово! Расписание на неделю обновлено.")
         return ConversationHandler.END
 
-    # Сохранение одного дня (либо базового, либо временного)
     lessons = context.user_data.get("edit_lessons")
     if lessons is None:
         await query.edit_message_text("Сессия редактирования потеряна. Запусти заново: /edit_schedule")
@@ -1205,14 +1201,12 @@ async def edit_schedule_confirm(update: Update, context: ContextTypes.DEFAULT_TY
             return ConversationHandler.END
 
         label = context.user_data.get("edit_label") or edit_date
-        # Уведомляем подписчиков
         msg = "📢 Временное расписание обновлено:\n\n" + _format_day_table_html(label, lessons)
         asyncio.create_task(_notify_subscribers(msg))
 
         await query.edit_message_text(f"Готово! Временное расписание для «{label}» обновлено.")
         return ConversationHandler.END
 
-    # mode == "base", один день недели (или профиль субботы)
     if not day:
         await query.edit_message_text("Сессия редактирования потеряна. Запусти заново: /edit_schedule")
         return ConversationHandler.END
@@ -1236,7 +1230,6 @@ async def edit_schedule_confirm(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(f"Не удалось сохранить расписание: {e}")
         return ConversationHandler.END
 
-    # Уведомляем подписчиков
     msg = "📢 Обновлено расписание:\n\n" + _format_day_table_html(f"Суббота — {label}" if day == "Суббота" else day, lessons)
     asyncio.create_task(_notify_subscribers(msg))
 
@@ -1294,7 +1287,6 @@ async def telegram_webhook(request: Request):
 async def startup_event():
     await bot_app.initialize()
     await bot_app.bot.set_webhook(f"{BOT_URL.rstrip('/')}{WEBHOOK_PATH}")
-    # Подсказки команд в интерфейсе Telegram (меню при вводе "/")
     await bot_app.bot.set_my_commands(
         [
             BotCommand("start", "Запуск / приветствие"),
@@ -1306,7 +1298,6 @@ async def startup_event():
         ]
     )
 
-    # Планировщик напоминаний
     global scheduler
     scheduler = AsyncIOScheduler(timezone=_get_tz())
     _load_temp_schedule_from_disk()
@@ -1319,7 +1310,6 @@ async def startup_event():
     await bot_app.start()
     print("✅ Webhook установлен, бот готов к работе")
 
-    # --- Автопинг для Render ---
     async def ping_self():
         async with httpx.AsyncClient(timeout=10.0) as client:
             while True:
@@ -1328,7 +1318,7 @@ async def startup_event():
                     print(f"[ping] {resp.status_code} {datetime.now().strftime('%H:%M:%S')}")
                 except Exception as e:
                     print(f"[ping error] {e}")
-                await asyncio.sleep(600)  # каждые 10 минут
+                await asyncio.sleep(600)
 
     asyncio.create_task(ping_self())
 
