@@ -79,10 +79,10 @@ SATURDAY_PROFILES: list[tuple[str, str]] = [
     ("Соцгум", "Соцгум"),
     ("Инфотех_1", "Инфотех 1 группа"),
     ("Инфотех_2", "Инфотех 2 группа"),
-    ("Общеобр-ый_1", "Общеобр-ый 1 группа"),
-    ("Общеобр-ый_2", "Общеобр-ый 2 группа"),
-    ("Общеобр-ый_3", "Общеобр-ый 3 группа"),
-    ("Общеобр-ый_4", "Общеобр-ый 4 группа"),
+    ("Общеобразовательный_1", "Общеобразовательный 1 группа"),
+    ("Общеобразовательный_2", "Общеобразовательный 2 группа"),
+    ("Общеобразовательный_3", "Общеобразовательный 3 группа"),
+    ("Общеобразовательный_4", "Общеобразовательный 4 группа"),
 ]
 SATURDAY_PROFILE_KEYS = [k for k, _ in SATURDAY_PROFILES]
 SATURDAY_PROFILE_LABELS = {k: label for k, label in SATURDAY_PROFILES}
@@ -803,16 +803,21 @@ async def edit_schedule_date_entered(update: Update, context: ContextTypes.DEFAU
     context.user_data["edit_label"] = f"{d.strftime('%d.%m.%Y')} ({day_ru})"
     context.user_data["edit_mode"] = "temp"
 
-    if key in temp_schedule:
-        lessons = temp_schedule[key]
-        if isinstance(lessons, dict):
-            lessons = lessons.get(SATURDAY_PROFILE_KEYS[0], []) if SATURDAY_PROFILE_KEYS else []
-    else:
-        lessons = schedule.get(day_ru, [])
-        if isinstance(lessons, dict):
-            lessons = lessons.get(SATURDAY_PROFILE_KEYS[0], []) if SATURDAY_PROFILE_KEYS else []
+    # Если суббота — сначала выбор профиля
+    if day_ru == "Суббота":
+        await update.message.reply_text(
+            f"Дата {d.strftime('%d.%m.%Y')} — суббота.\n"
+            "Выбери профиль для редактирования:",
+            reply_markup=_saturday_profile_keyboard(),
+        )
+        return EDIT_CHOOSE_SATURDAY_PROFILE
 
-    current_text = "\n".join(lessons) if lessons else "— (пусто) —"
+    current = schedule.get(day_ru, [])
+    if key in temp_schedule:
+        raw = temp_schedule[key]
+        current = raw if isinstance(raw, list) else []
+
+    current_text = "\n".join(current) if current else "— (пусто) —"
     await update.message.reply_text(
         f"Текущее временное расписание для {context.user_data['edit_label']}:\n"
         f"{current_text}\n\n"
@@ -930,16 +935,34 @@ async def edit_schedule_saturday_profile_chosen(update: Update, context: Context
 
     context.user_data["edit_saturday_profile"] = profile_key
     label = SATURDAY_PROFILE_LABELS.get(profile_key, profile_key)
+    mode = context.user_data.get("edit_mode", "base")
 
-    sat_data = schedule.get("Суббота")
-    if isinstance(sat_data, dict) and profile_key in sat_data:
-        current = sat_data[profile_key]
+    # Берём текущее расписание: для temp — из temp_schedule, для base — из schedule
+    current: list[str] = []
+    if mode == "temp":
+        edit_date = context.user_data.get("edit_date")
+        if edit_date and edit_date in temp_schedule:
+            raw = temp_schedule[edit_date]
+            if isinstance(raw, dict):
+                current = raw.get(profile_key, [])
+            # если list — значит раньше было без профилей, считаем пустым
+        if not current:
+            # Подставляем основное как подсказку
+            sat_data = schedule.get("Суббота")
+            if isinstance(sat_data, dict):
+                current = sat_data.get(profile_key, [])
+        date_label = context.user_data.get("edit_label", "")
+        header = f"Текущее временное расписание для «{date_label} — {label}»"
     else:
-        current = []
+        sat_data = schedule.get("Суббота")
+        if isinstance(sat_data, dict):
+            current = sat_data.get(profile_key, [])
+        header = f"Текущие занятия для «Суббота — {label}»"
+
     current_text = "\n".join(current) if current else "— (пусто) —"
 
     await query.edit_message_text(
-        f"Текущие занятия для «Суббота — {label}»:\n{current_text}\n\n"
+        f"{header}:\n{current_text}\n\n"
         "Пришли новое расписание одним сообщением: по одной строке на урок.\n"
         "В группе с privacy mode: /set <список уроков>\n"
         "Чтобы очистить — отправь слово: пусто. Отмена — /cancel",
@@ -1215,18 +1238,33 @@ async def edit_schedule_confirm(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("Сессия редактирования потеряна. Запусти заново: /edit_schedule")
             return ConversationHandler.END
 
-        temp_schedule[edit_date] = lessons
+        profile_key = context.user_data.get("edit_saturday_profile")
+        if profile_key:
+            # Суббота по профилям — сохраняем как dict, не затирая другие профили
+            existing = temp_schedule.get(edit_date)
+            if not isinstance(existing, dict):
+                existing = {}
+            existing[profile_key] = lessons
+            temp_schedule[edit_date] = existing
+            profile_label = SATURDAY_PROFILE_LABELS.get(profile_key, profile_key)
+            date_label = context.user_data.get("edit_label") or edit_date
+            display_label = f"{date_label} — {profile_label}"
+            notify_label = f"Суббота — {profile_label}"
+        else:
+            temp_schedule[edit_date] = lessons
+            display_label = context.user_data.get("edit_label") or edit_date
+            notify_label = display_label
+
         try:
             _save_temp_schedule_to_disk()
         except Exception as e:
             await query.edit_message_text(f"Не удалось сохранить временное расписание: {e}")
             return ConversationHandler.END
 
-        label = context.user_data.get("edit_label") or edit_date
-        msg = "📢 Временное расписание обновлено:\n\n" + _format_day_table_html(label, lessons)
+        msg = "📢 Временное расписание обновлено:\n\n" + _format_day_table_html(notify_label, lessons)
         asyncio.create_task(_notify_subscribers(msg))
 
-        await query.edit_message_text(f"Готово! Временное расписание для «{label}» обновлено.")
+        await query.edit_message_text(f"Готово! Временное расписание для «{display_label}» обновлено.")
         return ConversationHandler.END
 
     if not day:
