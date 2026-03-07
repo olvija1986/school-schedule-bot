@@ -496,14 +496,25 @@ async def inline_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Сегодня
         today_day, today_lessons = _get_lessons_for_date(now.date())
-        if today_day == "Суббота" and not today_lessons:
-            for label, prof_lessons in _get_saturday_profiles_for_date(now.date()):
+        if today_day == "Суббота":
+            today_profiles = _get_saturday_profiles_for_date(now.date())
+            for label, prof_lessons in today_profiles:
                 text = _truncate_message(_format_day_table_html(f"Суббота — {label}", prof_lessons))
                 results.append(InlineQueryResultArticle(
                     id=str(uuid.uuid4()),
                     title=f"Сегодня — {label}",
                     description="Суббота, сегодня",
                     input_message_content=InputTextMessageContent(text, parse_mode="HTML"),
+                ))
+            if today_profiles:
+                all_text = _truncate_message("\n\n".join(
+                    _format_day_table_html(f"Суббота — {lbl}", lsns) for lbl, lsns in today_profiles
+                ))
+                results.append(InlineQueryResultArticle(
+                    id=str(uuid.uuid4()),
+                    title="Сегодня — Все профили",
+                    description="Суббота сегодня — все профили одним сообщением",
+                    input_message_content=InputTextMessageContent(all_text, parse_mode="HTML"),
                 ))
         else:
             text = _truncate_message(_format_day_table_html(today_day, today_lessons))
@@ -515,14 +526,25 @@ async def inline_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Завтра
         tomorrow_day, tomorrow_lessons = _get_lessons_for_date(tomorrow_date)
-        if tomorrow_day == "Суббота" and not tomorrow_lessons:
-            for label, prof_lessons in _get_saturday_profiles_for_date(tomorrow_date):
+        if tomorrow_day == "Суббота":
+            tomorrow_profiles = _get_saturday_profiles_for_date(tomorrow_date)
+            for label, prof_lessons in tomorrow_profiles:
                 text = _truncate_message(_format_day_table_html(f"Суббота — {label}", prof_lessons))
                 results.append(InlineQueryResultArticle(
                     id=str(uuid.uuid4()),
                     title=f"Завтра — {label}",
                     description="Суббота, завтра",
                     input_message_content=InputTextMessageContent(text, parse_mode="HTML"),
+                ))
+            if tomorrow_profiles:
+                all_text = _truncate_message("\n\n".join(
+                    _format_day_table_html(f"Суббота — {lbl}", lsns) for lbl, lsns in tomorrow_profiles
+                ))
+                results.append(InlineQueryResultArticle(
+                    id=str(uuid.uuid4()),
+                    title="Завтра — Все профили",
+                    description="Суббота завтра — все профили одним сообщением",
+                    input_message_content=InputTextMessageContent(all_text, parse_mode="HTML"),
                 ))
         else:
             text = _truncate_message(_format_day_table_html(tomorrow_day, tomorrow_lessons))
@@ -549,15 +571,27 @@ async def inline_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Уровень 1: сегодня ──────────────────────────────────────────────────
     if query_text in ["сегодня", "today"]:
         day, lessons = _get_lessons_for_date(now.date())
-        if day == "Суббота" and not lessons:
-            # Суббота с профилями — показываем профили как результаты
-            for label, prof_lessons in _get_saturday_profiles_for_date(now.date()):
+        if day == "Суббота":
+            profiles = _get_saturday_profiles_for_date(now.date())
+            # Каждый профиль отдельной кнопкой
+            for label, prof_lessons in profiles:
                 text = _truncate_message(_format_day_table_html(f"Суббота — {label}", prof_lessons))
                 results.append(InlineQueryResultArticle(
                     id=str(uuid.uuid4()),
                     title=f"{label}",
                     description=f"Суббота, сегодня — {label}",
                     input_message_content=InputTextMessageContent(text, parse_mode="HTML"),
+                ))
+            # Все профили одним сообщением
+            if profiles:
+                all_text = _truncate_message("\n\n".join(
+                    _format_day_table_html(f"Суббота — {lbl}", lsns) for lbl, lsns in profiles
+                ))
+                results.append(InlineQueryResultArticle(
+                    id=str(uuid.uuid4()),
+                    title="Все профили",
+                    description="Суббота сегодня — все профили одним сообщением",
+                    input_message_content=InputTextMessageContent(all_text, parse_mode="HTML"),
                 ))
         else:
             text = _truncate_message(_format_day_table_html(day, lessons))
@@ -573,14 +607,27 @@ async def inline_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query_text in ["завтра", "tomorrow"]:
         tomorrow_date = (now + timedelta(days=1)).date()
         day, lessons = _get_lessons_for_date(tomorrow_date)
-        if day == "Суббота" and not lessons:
-            for label, prof_lessons in _get_saturday_profiles_for_date(tomorrow_date):
+        if day == "Суббота":
+            profiles = _get_saturday_profiles_for_date(tomorrow_date)
+            # Каждый профиль отдельной кнопкой
+            for label, prof_lessons in profiles:
                 text = _truncate_message(_format_day_table_html(f"Суббота — {label}", prof_lessons))
                 results.append(InlineQueryResultArticle(
                     id=str(uuid.uuid4()),
                     title=f"{label}",
                     description=f"Суббота, завтра — {label}",
                     input_message_content=InputTextMessageContent(text, parse_mode="HTML"),
+                ))
+            # Все профили одним сообщением
+            if profiles:
+                all_text = _truncate_message("\n\n".join(
+                    _format_day_table_html(f"Суббота — {lbl}", lsns) for lbl, lsns in profiles
+                ))
+                results.append(InlineQueryResultArticle(
+                    id=str(uuid.uuid4()),
+                    title="Все профили",
+                    description="Суббота завтра — все профили одним сообщением",
+                    input_message_content=InputTextMessageContent(all_text, parse_mode="HTML"),
                 ))
         else:
             text = _truncate_message(_format_day_table_html(day, lessons))
