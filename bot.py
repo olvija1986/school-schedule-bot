@@ -412,62 +412,104 @@ def _truncate_message(text: str, max_len: int = _MAX_MESSAGE_LEN - 100) -> str:
     return text[: max_len - 3].rstrip() + "…"
 
 def _format_week_text() -> str:
-    """Текст расписания на неделю (Суббота по профилям, если задано)."""
+    """Текст расписания на неделю с учётом временных замен."""
+    now_tz = datetime.now(tz=_get_tz())
     blocks: list[str] = []
     for day in SCHEDULE_DAYS:
-        if day not in schedule:
+        # Ищем ближайшую дату этого дня в течение текущей недели (пн-вс)
+        # Для проверки temp_schedule берём дату ближайшего такого дня
+        day_idx = SCHEDULE_DAYS.index(day)  # 0=Пн, 6=Вс
+        today_idx = now_tz.weekday()  # 0=Пн, 6=Вс
+        delta = day_idx - today_idx
+        target_date = (now_tz + timedelta(days=delta)).date()
+        date_key = target_date.isoformat()
+
+        if day == "Суббота":
+            profiles = _get_saturday_profiles_for_date(target_date)
+            for label, lessons in profiles:
+                if lessons:
+                    blocks.append(_format_day_table_html(f"Суббота — {label}", lessons))
             continue
-        data = schedule[day]
-        if day == "Суббота" and isinstance(data, dict):
-            for k in SATURDAY_PROFILE_KEYS:
-                if k in data and data[k]:
-                    label = SATURDAY_PROFILE_LABELS.get(k, k)
-                    blocks.append(_format_day_table_html(f"Суббота — {label}", data[k]))
-        elif day == "Суббота" and isinstance(data, list) and data:
-            blocks.append(_format_day_table_html("Суббота", data))
-        elif isinstance(data, list) and data:
+
+        # Для обычных дней — temp перекрывает основное
+        if date_key in temp_schedule:
+            raw = temp_schedule[date_key]
+            data = raw if isinstance(raw, list) else []
+        else:
+            data = schedule.get(day, [])
+
+        if isinstance(data, list) and data:
             blocks.append(_format_day_table_html(day, data))
+
     return "\n\n".join(blocks) if blocks else _format_day_table_html("Неделя", [])
 
 def _format_week_text_without_saturday() -> str:
-    """Текст расписания на неделю без субботы (для inline — суббота отдельными кнопками)."""
+    """Текст расписания на неделю без субботы, с учётом временных замен."""
+    now_tz = datetime.now(tz=_get_tz())
     blocks: list[str] = []
     for day in SCHEDULE_DAYS:
         if day == "Суббота":
             continue
-        if day not in schedule:
+        if day not in schedule and day not in [d for d in SCHEDULE_DAYS]:
             continue
-        data = schedule[day]
+        day_idx = SCHEDULE_DAYS.index(day)
+        today_idx = now_tz.weekday()
+        delta = day_idx - today_idx
+        target_date = (now_tz + timedelta(days=delta)).date()
+        date_key = target_date.isoformat()
+
+        if date_key in temp_schedule:
+            raw = temp_schedule[date_key]
+            data = raw if isinstance(raw, list) else []
+        else:
+            data = schedule.get(day, [])
+
         if isinstance(data, list) and data:
             blocks.append(_format_day_table_html(day, data))
     return "\n\n".join(blocks) if blocks else _format_day_table_html("Неделя", [])
 
 def _get_saturday_inline_results_for_week() -> list[InlineQueryResultArticle]:
-    """Создаёт отдельный результат для каждого профиля субботы (для inline-запроса week)."""
+    """Создаёт отдельный результат для каждого профиля субботы с учётом temp_schedule."""
     results = []
-    sat_data = schedule.get("Суббота")
-    if sat_data is None:
+    now_tz = datetime.now(tz=_get_tz())
+    # Ближайшая суббота текущей недели
+    today_idx = now_tz.weekday()  # 0=Пн, 6=Вс
+    delta = 5 - today_idx  # 5=Суббота
+    sat_date = (now_tz + timedelta(days=delta)).date()
+
+    profiles = _get_saturday_profiles_for_date(sat_date)
+    if not profiles:
         return results
 
-    if isinstance(sat_data, list) and sat_data:
-        text = _truncate_message(_format_day_table_html("Суббота", sat_data))
+    if len(profiles) == 1 and profiles[0][0] == "Суббота":
+        # Единый блок без профилей
+        text = _truncate_message(_format_day_table_html("Суббота", profiles[0][1]))
         results.append(InlineQueryResultArticle(
             id=str(uuid.uuid4()),
             title="Суббота",
             description="Расписание субботы",
             input_message_content=InputTextMessageContent(text, parse_mode="HTML"),
         ))
-    elif isinstance(sat_data, dict):
-        for key in SATURDAY_PROFILE_KEYS:
-            if key in sat_data and sat_data[key]:
-                label = SATURDAY_PROFILE_LABELS.get(key, key)
-                text = _truncate_message(_format_day_table_html(f"Суббота — {label}", sat_data[key]))
+    else:
+        for label, lessons in profiles:
+            if lessons:
+                text = _truncate_message(_format_day_table_html(f"Суббота — {label}", lessons))
                 results.append(InlineQueryResultArticle(
                     id=str(uuid.uuid4()),
                     title=f"Суббота — {label}",
                     description="Расписание субботы по профилю",
                     input_message_content=InputTextMessageContent(text, parse_mode="HTML"),
                 ))
+        # Все профили одним сообщением
+        all_text = _truncate_message("\n\n".join(
+            _format_day_table_html(f"Суббота — {lbl}", lsns) for lbl, lsns in profiles if lsns
+        ))
+        results.append(InlineQueryResultArticle(
+            id=str(uuid.uuid4()),
+            title="Суббота — Все профили",
+            description="Все профили субботы одним сообщением",
+            input_message_content=InputTextMessageContent(all_text, parse_mode="HTML"),
+        ))
     return results
 
 # ================== Inline-запрос ==================
