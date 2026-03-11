@@ -1,6 +1,7 @@
-import os, json, uuid, asyncio, httpx, html, re
+import os, json, uuid, asyncio, httpx, html, re, logging, hmac, hashlib
 from datetime import datetime, timedelta, date
 from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 from zoneinfo import ZoneInfo
 from telegram import (
     BotCommand,
@@ -8,6 +9,10 @@ from telegram import (
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
     InputTextMessageContent,
+    WebAppInfo,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove,
     Update,
 )
 from telegram.ext import (
@@ -22,10 +27,17 @@ from telegram.ext import (
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from urllib.parse import parse_qsl
 
 # ================== Настройки ==================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
-BOT_URL = os.environ.get("BOT_URL")  # например: https://school-schedule-bot.onrender.com
+BOT_URL = os.environ.get("BOT_URL")  # например: https://school-schedule-bot2.onrender.com
 WEBHOOK_PATH = f"/webhook/{TOKEN}"
 
 if not TOKEN or not BOT_URL:
@@ -39,6 +51,33 @@ ADMIN_USER_IDS = {
     for x in _ADMIN_USER_IDS_RAW.split(",")
     if x.strip().isdigit()
 }
+
+# Динамические админы (добавляются через интерфейс, хранятся в файле)
+ADMINS_PATH = "admins.json"
+dynamic_admins: set[int] = set()
+
+
+def _load_dynamic_admins() -> None:
+    global dynamic_admins
+    try:
+        with open(ADMINS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            dynamic_admins = {int(x) for x in data if str(x).lstrip("-").isdigit()}
+        else:
+            dynamic_admins = set()
+    except FileNotFoundError:
+        dynamic_admins = set()
+    except Exception:
+        dynamic_admins = set()
+
+
+def _save_dynamic_admins() -> None:
+    tmp = f"{ADMINS_PATH}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(sorted(dynamic_admins), f, ensure_ascii=False)
+        f.write("\n")
+    os.replace(tmp, ADMINS_PATH)
 
 # ================== Загрузка расписания ==================
 with open("schedule.json", "r", encoding="utf-8") as f:
@@ -200,11 +239,107 @@ async def _notify_subscribers(text: str, parse_mode: str = "HTML") -> None:
         except Exception:
             pass
 
+def _is_superadmin_user_id(user_id: int) -> bool:
+    """Суперадмин — только из переменной окружения ADMIN_USER_IDS."""
+    return user_id in ADMIN_USER_IDS
+
+
 def _is_admin(update: Update) -> bool:
-    if not ADMIN_USER_IDS:
+    if not ADMIN_USER_IDS and not dynamic_admins:
         return True
     user = update.effective_user
-    return bool(user and user.id in ADMIN_USER_IDS)
+    return bool(user and _is_admin_user_id(user.id))
+
+
+def _is_admin_user_id(user_id: int) -> bool:
+    """Проверка администратора: env-список ИЛИ динамический список."""
+    if not ADMIN_USER_IDS and not dynamic_admins:
+        return True
+    return user_id in ADMIN_USER_IDS or user_id in dynamic_admins
+
+
+def _verify_webapp_init_data(init_data: str) -> dict | None:
+    """
+    Проверка подписи initData от Telegram WebApp.
+    Возвращает dict с полями initData (включая 'user' как JSON‑строку),
+    либо None, если подпись неверна.
+    """
+    init_data = (init_data or "").strip()
+    if not init_data:
+        return None
+    # Пытаемся аккуратно распарсить initData
+    try:
+        data = dict(parse_qsl(init_data, keep_blank_values=True))
+    except Exception:
+        return None
+
+    hash_value = data.pop("hash", None)
+    if not hash_value:
+        return None
+
+    # Собираем data_check_string по спецификации Telegram:
+    # все пары key=value кроме hash, отсортированные по ключу и разделённые \n
+    check_string = "\n".join(f"{k}={v}" for k, v in sorted(data.items()))
+    secret_key = hmac.new(
+        key="WebAppData".encode("utf-8"),
+        msg=TOKEN.encode("utf-8"),
+        digestmod=hashlib.sha256,
+    ).digest()
+    calc_hash = hmac.new(
+        secret_key, check_string.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(calc_hash, hash_value):
+        return None
+    return data
+
+
+def _get_user_from_init_data(init_data: str) -> dict | None:
+    """
+    Извлекает объект user из initData WebApp.
+    Сначала пробуем строгую проверку подписи, затем более мягкий разбор без проверки,
+    чтобы избежать ошибок bad_init_data в нестандартных окружениях.
+    """
+    verified = _verify_webapp_init_data(init_data)
+    data_dict: dict | None = verified
+
+    # Фолбэк: если подпись не прошла, пробуем просто распарсить строку
+    if data_dict is None:
+        try:
+            data_dict = dict(parse_qsl((init_data or "").strip(), keep_blank_values=True))
+        except Exception:
+            data_dict = None
+
+    if not data_dict:
+        return None
+
+    raw_user = data_dict.get("user")
+    if not raw_user:
+        return None
+    try:
+        user = json.loads(raw_user)
+        if isinstance(user, dict) and "id" in user:
+            return user
+    except Exception:
+        return None
+    return None
+
+def _log_user(update: Update, action: str = "") -> None:
+    """Логирует пользователя, приславшего обновление."""
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user:
+        return
+    name = user.full_name or ""
+    username = f"@{user.username}" if user.username else "no_username"
+    chat_info = f"chat={chat.id} ({chat.type})" if chat else ""
+    text = ""
+    if update.message and update.message.text:
+        text = f" | text={update.message.text[:80]!r}"
+    elif update.callback_query and update.callback_query.data:
+        text = f" | callback={update.callback_query.data!r}"
+    elif update.inline_query:
+        text = f" | inline_query={update.inline_query.query!r}"
+    logger.info(f"USER id={user.id} {username} ({name}) {chat_info}{text}{(' | ' + action) if action else ''}")
 
 def _save_schedule_to_disk() -> None:
     tmp_path = "schedule.json.tmp"
@@ -356,21 +491,176 @@ def _get_lessons_for_date(d: date) -> tuple[str, list[str]]:
         return day_ru, []
     return day_ru, schedule.get(day_ru, [])
 
-async def _send_daily_reminder(chat_id: int):
-    today = datetime.now(tz=_get_tz()).date()
-    day_eng = today.strftime("%A")
+async def _send_daily_reminder(chat_id: int, day_type: str = "today"):
+    now = datetime.now(tz=_get_tz())
+    target_date = now.date() if day_type == "today" else (now + timedelta(days=1)).date()
+    day_eng = target_date.strftime("%A")
     day_ru = DAY_MAP.get(day_eng, day_eng)
+    date_label = "сегодня" if day_type == "today" else "завтра"
+
     if day_ru == "Суббота":
-        profiles = _get_saturday_profiles_for_date(today)
+        profiles = _get_saturday_profiles_for_date(target_date)
         if profiles:
             parts = [_format_day_table_html(f"Суббота — {label}", lessons) for label, lessons in profiles]
-            text = _truncate_message("📅 Расписание на сегодня (суббота):\n\n" + "\n\n".join(parts))
+            text = _truncate_message(f"📅 Расписание на {date_label} (суббота):\n\n" + "\n\n".join(parts))
         else:
             text = _format_day_table_html("Суббота", [])
     else:
-        day, lessons = _get_lessons_for_date(today)
-        text = _format_day_table_html(day, lessons)
+        day, lessons = _get_lessons_for_date(target_date)
+        header = f"📅 Расписание на {date_label} ({day}):\n\n"
+        text = _truncate_message(header + _format_day_table_html(day, lessons))
     await bot_app.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+
+
+def _format_week_text_base() -> str:
+    """Текст основного расписания на неделю (Пн–Вс) без временных замен."""
+    blocks: list[str] = []
+    for day in SCHEDULE_DAYS:
+        if day == "Суббота":
+            sat = schedule.get("Суббота")
+            if isinstance(sat, dict):
+                for pk in SATURDAY_PROFILE_KEYS:
+                    if pk in sat and sat[pk]:
+                        label = SATURDAY_PROFILE_LABELS.get(pk, pk)
+                        blocks.append(_format_day_table_html(f"Суббота — {label}", sat[pk]))
+            elif isinstance(sat, list) and sat:
+                blocks.append(_format_day_table_html("Суббота", sat))
+            continue
+
+        data = schedule.get(day, [])
+        if isinstance(data, list) and data:
+            blocks.append(_format_day_table_html(day, data))
+
+    return "\n\n".join(blocks) if blocks else _format_day_table_html("Неделя", [])
+
+
+def _nearest_saturday_profiles() -> list[tuple[str, list[str]]]:
+    """Профили ближайшей субботы текущей недели с учётом временных замен."""
+    now_tz = datetime.now(tz=_get_tz())
+    today_idx = now_tz.weekday()
+    delta = 5 - today_idx  # 5 = суббота
+    sat_date = (now_tz + timedelta(days=delta)).date()
+    return _get_saturday_profiles_for_date(sat_date)
+
+
+def _format_schedule_webapp_html(day_label: str, lessons: list[str]) -> str:
+    """Красивые HTML-карточки расписания для WebApp (вкладка Расписание)."""
+    rows_html = []
+    for idx, line in enumerate(lessons or [], start=1):
+        p = _parse_lesson_line(line)
+        subject = html.escape(p["subject"] or "—")
+        time_str = ""
+        if p["start"] and p["end"]:
+            time_str = f'{html.escape(p["start"])} – {html.escape(p["end"])}'
+        elif p["start"]:
+            time_str = html.escape(p["start"])
+        room_html = (
+            f'<span class="sc-room">{html.escape(p["room"])}</span>'
+            if p["room"] else ""
+        )
+        rows_html.append(
+            f'<div class="sc-lesson">'
+            f'<div class="sc-num">{idx}</div>'
+            f'<div class="sc-body">'
+            f'<div class="sc-subject">{subject}</div>'
+            f'<div class="sc-meta"><span class="sc-time">{time_str}</span>{room_html}</div>'
+            f'</div></div>'
+        )
+    inner = "\n".join(rows_html) if rows_html else '<div class="sc-empty">Нет занятий</div>'
+    return (
+        f'<div class="sc-day-block">'
+        f'<div class="sc-day-title">{html.escape(day_label)}</div>'
+        f'{inner}'
+        f'</div>'
+    )
+
+
+def _format_week_webapp_html(blocks_fn) -> str:
+    """Собирает HTML для недели из функции, возвращающей список (label, lessons)."""
+    parts = blocks_fn()
+    return "\n".join(
+        _format_schedule_webapp_html(label, lessons) for label, lessons in parts
+    ) if parts else _format_schedule_webapp_html("Нет занятий", [])
+
+
+def _get_schedule_html_for_day_type(day_type: str = "today") -> str:
+    """HTML‑текст расписания для различных режимов (для WebApp API)."""
+    now = datetime.now(tz=_get_tz())
+
+    if day_type == "week":
+        def _week_blocks():
+            result = []
+            now_tz = datetime.now(tz=_get_tz())
+            for day in SCHEDULE_DAYS:
+                day_idx = SCHEDULE_DAYS.index(day)
+                today_idx = now_tz.weekday()
+                target_date = (now_tz + timedelta(days=day_idx - today_idx)).date()
+                if day == "Суббота":
+                    for label, lessons in _get_saturday_profiles_for_date(target_date):
+                        if lessons:
+                            result.append((f"Суббота — {label}", lessons))
+                    continue
+                date_key = target_date.isoformat()
+                raw = temp_schedule.get(date_key)
+                data = raw if isinstance(raw, list) else schedule.get(day, [])
+                if isinstance(data, list) and data:
+                    result.append((day, data))
+            return result
+        parts = _week_blocks()
+        return "\n".join(_format_schedule_webapp_html(l, ls) for l, ls in parts) if parts else _format_schedule_webapp_html("Нет занятий", [])
+
+    if day_type == "week_base":
+        def _week_base_blocks():
+            result = []
+            for day in SCHEDULE_DAYS:
+                if day == "Суббота":
+                    sat = schedule.get("Суббота")
+                    if isinstance(sat, dict):
+                        for pk in SATURDAY_PROFILE_KEYS:
+                            if pk in sat and sat[pk]:
+                                result.append((f"Суббота — {SATURDAY_PROFILE_LABELS.get(pk, pk)}", sat[pk]))
+                    elif isinstance(sat, list) and sat:
+                        result.append(("Суббота", sat))
+                    continue
+                data = schedule.get(day, [])
+                if isinstance(data, list) and data:
+                    result.append((day, data))
+            return result
+        parts = _week_base_blocks()
+        return "\n".join(_format_schedule_webapp_html(l, ls) for l, ls in parts) if parts else _format_schedule_webapp_html("Нет занятий", [])
+
+    if day_type.startswith("sat_profile:"):
+        profile_key = day_type.split("sat_profile:", 1)[1]
+        now_tz = datetime.now(tz=_get_tz())
+        sat_date = (now_tz + timedelta(days=5 - now_tz.weekday())).date()
+        profiles = _get_saturday_profiles_for_date(sat_date)
+        for label, lessons in profiles:
+            if profile_key == SATURDAY_LABEL_TO_KEY.get(label, label) or profile_key == label:
+                return _format_schedule_webapp_html(f"Суббота — {label}", lessons)
+        return _format_schedule_webapp_html("Нет занятий для выбранного профиля", [])
+
+    if day_type == "saturday":
+        profiles = _nearest_saturday_profiles()
+        if not profiles:
+            return _format_schedule_webapp_html("Суббота", [])
+        if len(profiles) == 1 and profiles[0][0] == "Суббота":
+            return _format_schedule_webapp_html("Суббота", profiles[0][1])
+        return "\n".join(_format_schedule_webapp_html(f"Суббота — {label}", lessons) for label, lessons in profiles)
+
+    target_date = now.date() if day_type == "today" else (now + timedelta(days=1)).date()
+    day_eng = target_date.strftime("%A")
+    day_ru = DAY_MAP.get(day_eng, day_eng)
+    date_label = "сегодня" if day_type == "today" else "завтра"
+
+    if day_ru == "Суббота":
+        profiles = _get_saturday_profiles_for_date(target_date)
+        if profiles:
+            return "\n".join(_format_schedule_webapp_html(f"Суббота — {label}", lessons) for label, lessons in profiles)
+        return _format_schedule_webapp_html("Суббота", [])
+
+    day, lessons = _get_lessons_for_date(target_date)
+    label = f"📅 {date_label.capitalize()} — {day}"
+    return _format_schedule_webapp_html(label, lessons)
 
 def _job_id_for(user_id: int) -> str:
     return f"reminder:{user_id}"
@@ -393,11 +683,12 @@ def _reschedule_user(user_id: int):
         return
     hour, minute = parsed
     chat_id = int(entry.get("chat_id"))
+    day_type = entry.get("day_type", "today")
     trigger = CronTrigger(hour=hour, minute=minute, timezone=_get_tz())
     scheduler.add_job(
         _send_daily_reminder,
         trigger=trigger,
-        args=[chat_id],
+        args=[chat_id, day_type],
         id=job_id,
         replace_existing=True,
         misfire_grace_time=3600,
@@ -523,6 +814,7 @@ def _get_saturday_inline_results_for_week() -> list[InlineQueryResultArticle]:
 #   суббота / saturday→ только профили субботы (текущей недели)
 #
 async def inline_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _log_user(update, "inline_query")
     query_text = (update.inline_query.query or "").lower().strip()
     now = datetime.now(tz=_get_tz())
     results = []
@@ -720,13 +1012,16 @@ async def inline_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================== Команда /start ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _log_user(update, "start")
     await update.message.reply_text(
         "Привет! Я бот для школьного расписания.\n"
         "Используй inline-запрос: @rasp7V_bot today / tomorrow / week\n"
-        "Для админов: /edit_schedule — редактировать расписание"
+        "Для админов: /edit_schedule — редактировать расписание",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _log_user(update, "help")
     await update.message.reply_text(
         "Команды:\n"
         "/start — приветствие\n"
@@ -734,17 +1029,38 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/edit_schedule — редактировать расписание (если разрешено)\n"
         "/cancel — отменить редактирование\n\n"
         "Напоминания:\n"
-        "/subscribe 07:30 — присылать расписание каждый день в указанное время\n"
+        "/subscribe 07:30 — расписание на сегодня каждый день в указанное время\n"
+        "/subscribe 07:30 завтра — расписание на завтра\n"
         "/unsubscribe — отключить напоминания\n\n"
         "Inline-режим:\n"
         "Набери @бота и выбери подсказку или введи: today / tomorrow / week\n\n"
+        "Мини‑приложение:\n"
+        "/app — открыть мини‑приложение с расписанием\n"
     )
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
+    _log_user(update, "subscribe")
     if not context.args:
-        await update.message.reply_text("Формат: /subscribe HH:MM (например /subscribe 07:30)")
+        # Показываем кнопки выбора времени с 06:00 до 20:00
+        rows: list[list[InlineKeyboardButton]] = []
+        row: list[InlineKeyboardButton] = []
+        for hour in range(6, 21):
+            t_btn = f"{hour:02d}:00"
+            row.append(InlineKeyboardButton(t_btn, callback_data=f"subtime:{t_btn}"))
+            if len(row) >= 4:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+
+        keyboard = InlineKeyboardMarkup(rows)
+        await update.message.reply_text(
+            "Выбери время, в которое присылать расписание.\n"
+            "Также можно ввести время вручную: /subscribe HH:MM [сегодня|завтра]",
+            reply_markup=keyboard,
+        )
         return
     parsed = _parse_hhmm(context.args[0])
     if not parsed:
@@ -752,22 +1068,116 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     hh, mm = parsed
     t = f"{hh:02d}:{mm:02d}"
+
+    # Если второй аргумент не передан — показываем кнопки выбора
+    if len(context.args) < 2:
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📅 На сегодня", callback_data=f"subscribe:{t}:today"),
+                InlineKeyboardButton("📅 На завтра", callback_data=f"subscribe:{t}:tomorrow"),
+            ]
+        ])
+        await update.message.reply_text(
+            f"Время {t} выбрано. Какое расписание присылать?",
+            reply_markup=keyboard,
+        )
+        return
+
+    # Второй аргумент передан напрямую
+    arg2 = context.args[1].lower().strip()
+    if arg2 in ("завтра", "tomorrow"):
+        day_type = "tomorrow"
+    elif arg2 in ("сегодня", "today"):
+        day_type = "today"
+    else:
+        await update.message.reply_text(
+            "Второй параметр должен быть «сегодня» или «завтра».\n"
+            "Пример: /subscribe 07:30 завтра"
+        )
+        return
+
     user = update.effective_user
     chat = update.effective_chat
     if not user or not chat:
         await update.message.reply_text("Не удалось определить пользователя/чат.")
         return
 
-    subscriptions[str(user.id)] = {"chat_id": chat.id, "time": t}
+    subscriptions[str(user.id)] = {"chat_id": chat.id, "time": t, "day_type": day_type}
     _save_subscriptions_to_disk()
     _reschedule_user(user.id)
+
+    day_label = "завтра" if day_type == "tomorrow" else "сегодня"
     await update.message.reply_text(
-        f"Ок! Буду присылать расписание каждый день в {t}.\n"
+        f"Ок! Буду присылать расписание на {day_label} каждый день в {t}."
+    )
+
+
+async def subscribe_time_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка нажатия кнопки выбора времени при подписке."""
+    query = update.callback_query
+    await query.answer()
+    _log_user(update, "subscribe_time_callback")
+
+    data = query.data or ""
+    # формат: subtime:HH:MM
+    parts = data.split(":")
+    if len(parts) != 3 or parts[0] != "subtime":
+        await query.edit_message_text("Что-то пошло не так. Попробуй ещё раз: /subscribe")
+        return
+
+    t = f"{parts[1]}:{parts[2]}"
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📅 На сегодня", callback_data=f"subscribe:{parts[1]}:{parts[2]}:today"),
+                InlineKeyboardButton("📅 На завтра", callback_data=f"subscribe:{parts[1]}:{parts[2]}:tomorrow"),
+            ]
+        ]
+    )
+
+    await query.edit_message_text(
+        f"Время {t} выбрано. Какое расписание присылать?",
+        reply_markup=keyboard,
+    )
+
+
+async def subscribe_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка нажатия кнопки сегодня/завтра при подписке."""
+    query = update.callback_query
+    await query.answer()
+    _log_user(update, "subscribe_callback")
+
+    data = query.data or ""
+    # формат: subscribe:HH:MM:today|tomorrow
+    parts = data.split(":")
+    if len(parts) != 4 or parts[0] != "subscribe":
+        await query.edit_message_text("Что-то пошло не так. Попробуй ещё раз: /subscribe")
+        return
+
+    t = f"{parts[1]}:{parts[2]}"
+    day_type = parts[3]
+
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat:
+        await query.edit_message_text("Не удалось определить пользователя/чат.")
+        return
+
+    subscriptions[str(user.id)] = {"chat_id": chat.id, "time": t, "day_type": day_type}
+    _save_subscriptions_to_disk()
+    _reschedule_user(user.id)
+
+    day_label = "завтра" if day_type == "tomorrow" else "сегодня"
+    logger.info(f"USER id={user.id} subscribed: time={t} day_type={day_type}")
+    await query.edit_message_text(
+        f"✅ Готово! Буду присылать расписание на {day_label} каждый день в {t}."
     )
 
 async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
+    _log_user(update, "unsubscribe")
     user = update.effective_user
     if not user:
         await update.message.reply_text("Не удалось определить пользователя.")
@@ -780,6 +1190,34 @@ async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
     await update.message.reply_text("Готово. Напоминания отключены.")
+
+
+async def chatid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /chatid — отвечает ID текущего чата (удобно для добавления группы в подписку)."""
+    if not update.message or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    chat_type = {"private": "личный", "group": "группа", "supergroup": "супергруппа", "channel": "канал"}.get(chat.type, chat.type)
+    await update.message.reply_text(
+        f"Chat ID этого чата:\n<code>{chat.id}</code>\n\nТип: {chat_type}",
+        parse_mode="HTML",
+    )
+
+
+async def open_app(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /app — кнопка для открытия мини‑приложения."""
+    if not update.message:
+        return
+    _log_user(update, "open_app")
+    url = f"{BOT_URL.rstrip('/')}/webapp"
+    # Inline‑кнопка: не занимает место внизу чата и не "прилипает"
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Открыть расписание", web_app=WebAppInfo(url=url))]]
+    )
+    await update.message.reply_text(
+        "Нажми кнопку, чтобы открыть мини‑приложение с расписанием.",
+        reply_markup=keyboard,
+    )
 
 # ================== Редактирование расписания (/edit_schedule) ==================
 EDIT_MODE, EDIT_CHOOSE_DAY, EDIT_CHOOSE_SATURDAY_PROFILE, EDIT_ENTER_DATE, EDIT_ENTER_LESSONS, EDIT_ENTER_WEEK, EDIT_CONFIRM, EDIT_ENTER_SAT_ALL = range(8)
@@ -819,6 +1257,7 @@ def _saturday_profile_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 async def edit_schedule_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _log_user(update, "edit_schedule_start")
     if not _is_admin(update):
         await update.message.reply_text("У вас нет прав на редактирование расписания.")
         return ConversationHandler.END
@@ -1584,8 +2023,12 @@ app = FastAPI()
 bot_app = ApplicationBuilder().token(TOKEN).build()
 bot_app.add_handler(CommandHandler("start", start))
 bot_app.add_handler(CommandHandler("help", help_command))
+bot_app.add_handler(CommandHandler("app", open_app))
 bot_app.add_handler(CommandHandler("subscribe", subscribe))
 bot_app.add_handler(CommandHandler("unsubscribe", unsubscribe))
+bot_app.add_handler(CommandHandler("chatid", chatid_command))
+bot_app.add_handler(CallbackQueryHandler(subscribe_time_callback, pattern=r"^subtime:"))
+bot_app.add_handler(CallbackQueryHandler(subscribe_callback, pattern=r"^subscribe:"))
 
 edit_conv = ConversationHandler(
     entry_points=[CommandHandler("edit_schedule", edit_schedule_start)],
@@ -1623,6 +2066,255 @@ async def telegram_webhook(request: Request):
     await bot_app.process_update(update)
     return {"ok": True}
 
+# ================== Яндекс Алиса ==================
+# Переменная окружения ALICE_SKILL_ID — опциональная проверка ID навыка.
+# Если не задана — запросы принимаются без проверки (удобно при разработке).
+ALICE_SKILL_ID = (os.environ.get("ALICE_SKILL_ID") or "").strip()
+
+_ALICE_MAX_LEN = 950  # запас до лимита 1024
+
+
+def _alice_truncate(text: str, max_len: int = _ALICE_MAX_LEN) -> str:
+    if len(text) <= max_len:
+        return text
+    return text[:max_len].rstrip(" ;,.\n") + "…"
+
+
+def _alice_format_screen(lessons: list[str]) -> str:
+    """Экранный формат: №. ЧЧ:ММ–ЧЧ:ММ  Предмет  каб.ХХХ"""
+    if not lessons:
+        return "Занятий нет"
+    lines = []
+    for i, line in enumerate(lessons, start=1):
+        p = _parse_lesson_line(line)
+        subj = p["subject"] or line
+        time_part = f"{p['start']}–{p['end']}" if p["start"] and p["end"] else p["start"] if p["start"] else ""
+        room_part = f"  каб.{p['room']}" if p["room"] else ""
+        time_str = f"  {time_part}" if time_part else ""
+        lines.append(f"{i}.{time_str}  {subj}{room_part}")
+    return "\n".join(lines)
+
+
+# Словарь расшифровки сокращений для голосового произношения Алисы.
+# Ключи — сокращения (в нижнем регистре), значения — полные названия.
+# Пополняйте по мере необходимости.
+_ALICE_SUBJECT_EXPAND: dict[str, str] = {
+    # РОВ
+    "ров":                      "Разговоры о важном",
+    # ВиСТ
+    "вист":                     "Вероятность и статистика",
+    "вист.":                    "Вероятность и статистика",
+    # Русский язык
+    "рус. яз":                  "Русский язык",
+    "рус.яз.":                  "Русский язык",
+    "рус. яз.":                 "Русский язык",
+    "рус.яз":                   "Русский язык",
+    # Английский язык
+    "англ. яз.":                "Английский язык",
+    "англ.яз.":                 "Английский язык",
+    "англ. яз":                 "Английский язык",
+    "англ.яз":                  "Английский язык",
+    # Физкультура
+    "физ-ра":                   "Физкультура",
+    "физ. культура":            "Физкультура",
+    # Окружающий мир
+    "окр. мир":                 "Окружающий мир",
+    "окр.мир":                  "Окружающий мир",
+    # Изобразительное искусство
+    "изо":                      "Изобразительное искусство",
+    # Дополнительные занятия
+    "доп занятия (1)":          "Дополнительные занятия",
+    "доп занятия (2)":          "Дополнительные занятия",
+    "доп. занятия":             "Дополнительные занятия",
+    # Орлята России
+    "орлята":                   "Орлята России",
+    # Математика / алгебра / геометрия
+    "матем.":                   "Математика",
+    "алг.":                     "Алгебра",
+    "геом.":                    "Геометрия",
+    # Практикум по математике
+    "практ. по мат-ке":         "Практикум по математике",
+    "практ.по мат-ке":          "Практикум по математике",
+    # Олимпийская математика
+    "олимп. мат-ка":            "Олимпиадная математика",
+    "олимп.мат-ка":             "Олимпиадная математика",
+    # Углублённая математика
+    "углубл. мате-ка":          "Углублённая математика",
+    "углубл.мате-ка":           "Углублённая математика",
+    # Алгоритмика
+    "алгоритмика":              "Алгоритмика",
+    # Экология растений
+    "экология растений":        "Экология растений",
+    # Введение в химию
+    "введение в химию":         "Введение в химию",
+    # Смысловое чтение
+    "смысловое чтение":         "Смысловое чтение",
+    # Прочие предметы
+    "обж":                      "Основы безопасности жизнедеятельности",
+    "инф.":                     "Информатика",
+    "биол.":                    "Биология",
+    "хим.":                     "Химия",
+    "физ.":                     "Физика",
+    "геогр.":                   "География",
+    "лит.":                     "Литература",
+    "ист.":                     "История",
+    "обществ.":                 "Обществознание",
+    "иностр. яз.":              "Иностранный язык",
+}
+
+
+def _alice_expand_subject(name: str) -> str:
+    """Заменяет сокращение предмета на полное название для TTS."""
+    return _ALICE_SUBJECT_EXPAND.get(name.lower().strip(), name)
+
+
+def _alice_format_tts(lessons: list[str]) -> str:
+    """Голосовой формат для TTS.
+    Произносим: начало первого урока, список предметов, конец последнего.
+    Кабинеты и время промежуточных уроков не произносим.
+    """
+    if not lessons:
+        return "занятий нет"
+    parsed = [_parse_lesson_line(line) for line in lessons]
+    subjects = [_alice_expand_subject(p["subject"] or lessons[i]) for i, p in enumerate(parsed)]
+    first_start = next((p["start"] for p in parsed if p["start"]), "")
+    last_end = next((p["end"] for p in reversed(parsed) if p["end"]), "")
+    intro = f"Начало в {first_start}. " if first_start else ""
+    outro = f" Конец в {last_end}." if last_end else "."
+    return f"{intro}{', '.join(subjects)}.{outro}"
+
+
+def _alice_day_text(day_type: str = "today") -> tuple[str, str]:
+    """Возвращает (display_text, tts_text) расписания на сегодня или завтра."""
+    now = datetime.now(tz=_get_tz())
+    if day_type == "tomorrow":
+        target_date = (now + timedelta(days=1)).date()
+        prefix = "Завтра"
+    else:
+        target_date = now.date()
+        prefix = "Сегодня"
+
+    day_eng = target_date.strftime("%A")
+    day_ru = DAY_MAP.get(day_eng, day_eng)
+
+    if day_ru == "Суббота":
+        profiles = _get_saturday_profiles_for_date(target_date)
+        if not profiles:
+            msg = f"{prefix}, суббота\nЗанятий нет"
+            return msg, f"{prefix}, суббота. Занятий нет."
+        text_parts, tts_parts = [], []
+        for label, lessons in profiles:
+            if lessons:
+                text_parts.append(f"[ {label} ]\n{_alice_format_screen(lessons)}")
+                tts_parts.append(f"Профиль {label}: {_alice_format_tts(lessons)}")
+        if not text_parts:
+            msg = f"{prefix}, суббота\nЗанятий нет"
+            return msg, f"{prefix}, суббота. Занятий нет."
+        header = f"{prefix}, суббота"
+        return header + "\n\n" + "\n\n".join(text_parts), f"{prefix}, суббота. " + " ".join(tts_parts)
+
+    _, lessons = _get_lessons_for_date(target_date)
+    if not lessons:
+        return f"{prefix}, {day_ru}\nЗанятий нет", f"{prefix}, {day_ru.lower()}. Занятий нет."
+
+    header = f"{prefix}, {day_ru}"
+    display = header + "\n" + _alice_format_screen(lessons)
+    tts = f"{prefix}, {day_ru.lower()}. {_alice_format_tts(lessons)}"
+    return display, tts
+
+
+_ALICE_HELP_TEXT = (
+    "Я расскажу расписание уроков. "
+    "Скажите «на сегодня» или «на завтра»."
+)
+
+_ALICE_MAIN_BUTTONS = [
+    {"title": "На сегодня", "hide": True},
+    {"title": "На завтра", "hide": True},
+]
+
+
+def _alice_resp(text: str, tts: str, session: dict, end_session: bool = False,
+                buttons: list | None = None) -> dict:
+    """Конструктор ответа Алисы."""
+    return {
+        "version": "1.0",
+        "session": session,
+        "response": {
+            "text": text[:1024],
+            "tts": tts[:1024],
+            "end_session": end_session,
+            "buttons": buttons or [],
+        },
+    }
+
+
+def _alice_handle_request(req_body: dict) -> dict:
+    """Основная логика обработки запроса от Алисы."""
+    session = req_body.get("session", {})
+    request = req_body.get("request", {})
+    command = (request.get("command") or "").lower().strip()
+    original = (request.get("original_utterance") or "").lower().strip()
+    text_to_check = command or original
+    is_new = session.get("new", False)
+
+    # ── Приветствие / помощь ─────────────────────────────────────────────────
+    if is_new or not command or text_to_check in {"помощь", "help", "что ты умеешь"}:
+        return _alice_resp(_ALICE_HELP_TEXT, _ALICE_HELP_TEXT, session,
+                           buttons=_ALICE_MAIN_BUTTONS)
+
+    # ── Выход ────────────────────────────────────────────────────────────────
+    if any(w in text_to_check for w in ["стоп", "выход", "хватит", "пока", "выйти"]):
+        msg = "До свидания! Удачной учёбы!"
+        return _alice_resp(msg, msg, session, end_session=True)
+
+    # ── Расписание на сегодня ────────────────────────────────────────────────
+    if any(w in text_to_check for w in ["сегодня", "на сегодня", "today", "сейчас", "что сегодня", "какие сегодня", "какое сегодня"]):
+        display, tts = _alice_day_text("today")
+        return _alice_resp(_alice_truncate(display, 1020), _alice_truncate(tts),
+                           session, buttons=_ALICE_MAIN_BUTTONS)
+
+    # ── Расписание на завтра ─────────────────────────────────────────────────
+    if any(w in text_to_check for w in ["завтра", "на завтра", "tomorrow", "что завтра", "какие завтра", "какое завтра"]):
+        display, tts = _alice_day_text("tomorrow")
+        return _alice_resp(_alice_truncate(display, 1020), _alice_truncate(tts),
+                           session, buttons=_ALICE_MAIN_BUTTONS)
+
+    # ── Общий запрос расписания → сегодня ───────────────────────────────────
+    if any(w in text_to_check for w in ["расписание", "уроки", "занятия", "какие уроки", "что за уроки"]):
+        display, tts = _alice_day_text("today")
+        return _alice_resp(_alice_truncate(display, 1020), _alice_truncate(tts),
+                           session, buttons=_ALICE_MAIN_BUTTONS)
+
+    # ── Не понял ─────────────────────────────────────────────────────────────
+    answer = "Не понял запрос. " + _ALICE_HELP_TEXT
+    return _alice_resp(answer, answer, session, buttons=_ALICE_MAIN_BUTTONS)
+
+
+@app.post("/alice")
+async def alice_webhook(request: Request):
+    """Эндпоинт для навыка Яндекс Алисы. URL: https://<домен>/alice"""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    if ALICE_SKILL_ID:
+        incoming_skill_id = (body.get("session") or {}).get("skill_id", "")
+        if incoming_skill_id != ALICE_SKILL_ID:
+            logger.warning(f"Alice: неверный skill_id: {incoming_skill_id!r}")
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+
+    try:
+        response = _alice_handle_request(body)
+    except Exception as e:
+        logger.exception(f"Alice handler error: {e}")
+        err_msg = "Произошла ошибка. Попробуйте позже."
+        response = _alice_resp(err_msg, err_msg, body.get("session") or {})
+
+    return JSONResponse(response)
+
+
 # ================== Lifespan ==================
 @app.on_event("startup")
 async def startup_event():
@@ -1635,6 +2327,7 @@ async def startup_event():
             BotCommand("edit_schedule", "Редактировать расписание"),
             BotCommand("subscribe", "Ежедневное напоминание (HH:MM)"),
             BotCommand("unsubscribe", "Отключить напоминания"),
+            BotCommand("chatid", "Узнать ID текущего чата"),
             BotCommand("cancel", "Отменить редактирование"),
         ]
     )
@@ -1643,12 +2336,22 @@ async def startup_event():
     scheduler = AsyncIOScheduler(timezone=_get_tz())
     _load_temp_schedule_from_disk()
     _load_subscriptions_from_disk()
+    _load_dynamic_admins()
     for user_id_str in list(subscriptions.keys()):
         if user_id_str.isdigit():
             _reschedule_user(int(user_id_str))
     scheduler.start()
 
     await bot_app.start()
+    # Сбрасываем Menu Button (кнопка под полем ввода) — используем /app вместо неё
+    try:
+        await bot_app.bot.delete_my_commands()
+    except Exception:
+        pass
+    try:
+        await bot_app.bot.set_chat_menu_button()  # сброс на дефолт (без WebApp-кнопки)
+    except Exception:
+        pass
     print("✅ Webhook установлен, бот готов к работе")
 
     async def ping_self():
@@ -1673,3 +2376,1943 @@ async def shutdown_event():
 @app.get("/")
 def root():
     return {"status": "Bot is running ✅"}
+
+
+WEBAPP_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Расписание</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      padding: 12px;
+      background: var(--tg-theme-bg-color, #ffffff);
+      color: var(--tg-theme-text-color, #000000);
+    }
+    h1 {
+      font-size: 20px;
+      margin: 0 0 8px;
+    }
+    h2 {
+      font-size: 16px;
+      margin: 16px 0 8px;
+    }
+    button {
+      padding: 8px 12px;
+      margin: 2px;
+      border-radius: 999px;
+      border: none;
+      cursor: pointer;
+      background: linear-gradient(135deg, #4e8cff, #8f6bff);
+      color: #ffffff;
+      font-size: 14px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.12);
+      transition: transform 0.08s ease-out, box-shadow 0.08s ease-out, opacity 0.1s;
+    }
+    button:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 3px 8px rgba(0,0,0,0.16);
+    }
+    button:active {
+      transform: translateY(0);
+      box-shadow: 0 1px 4px rgba(0,0,0,0.12);
+      opacity: 0.9;
+    }
+    button.secondary {
+      background: linear-gradient(135deg, #f1f3f6, #e2e6ec);
+      color: var(--tg-theme-hint-color, #555);
+      box-shadow: none;
+      border: 1px solid rgba(0,0,0,0.06);
+    }
+    #schedule-box {
+      margin-top: 8px;
+      height: calc(100vh - 210px);
+      overflow-y: auto;
+      padding-bottom: 16px;
+    }
+    /* ── Красивое расписание ── */
+    .sc-day-block { margin-bottom: 14px; }
+    .sc-day-title {
+      font-size: 15px;
+      font-weight: 700;
+      margin: 0 0 6px;
+      padding: 6px 10px;
+      border-radius: 10px;
+      background: linear-gradient(135deg, #4e8cff22, #8f6bff22);
+      border-left: 3px solid #7a6fff;
+      color: var(--tg-theme-text-color, #000);
+    }
+    .sc-empty {
+      font-size: 13px;
+      color: var(--tg-theme-hint-color, #888);
+      padding: 4px 10px;
+    }
+    .sc-lesson {
+      display: flex;
+      align-items: stretch;
+      gap: 0;
+      margin-bottom: 5px;
+      border-radius: 10px;
+      overflow: hidden;
+      background: var(--tg-theme-secondary-bg-color, #f5f5f5);
+      box-shadow: 0 1px 4px rgba(0,0,0,0.07);
+    }
+    .sc-num {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 32px;
+      font-size: 13px;
+      font-weight: 700;
+      color: #fff;
+      background: linear-gradient(160deg, #4e8cff, #8f6bff);
+      padding: 0 6px;
+    }
+    .sc-body {
+      flex: 1;
+      padding: 7px 10px;
+      min-width: 0;
+    }
+    .sc-subject {
+      font-size: 14px;
+      font-weight: 600;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      color: var(--tg-theme-text-color, #000);
+    }
+    .sc-meta {
+      display: flex;
+      gap: 8px;
+      margin-top: 2px;
+      font-size: 12px;
+      color: var(--tg-theme-hint-color, #777);
+      align-items: center;
+    }
+    .sc-time { white-space: nowrap; }
+    .sc-room {
+      margin-left: auto;
+      background: rgba(127,107,255,0.12);
+      color: #7a6fff;
+      border-radius: 6px;
+      padding: 1px 7px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    #status {
+      font-size: 12px;
+      color: var(--tg-theme-hint-color, #888);
+      margin-top: 4px;
+    }
+    input, select, textarea {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 6px 8px;
+      border-radius: 6px;
+      border: 1px solid rgba(0,0,0,0.15);
+      font-size: 14px;
+      margin-top: 4px;
+      background: var(--tg-theme-bg-color, #ffffff);
+      color: var(--tg-theme-text-color, #000000);
+    }
+    input, select {
+      height: 36px;
+      line-height: 24px;
+    }
+    textarea {
+      min-height: 140px;
+      resize: vertical;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 12px;
+    }
+    .row {
+      display: flex;
+      gap: 8px;
+      margin-top: 4px;
+    }
+    .card {
+      padding: 8px;
+      border-radius: 10px;
+      background: var(--tg-theme-secondary-bg-color, rgba(255,255,255,0.85));
+      box-shadow: 0 4px 14px rgba(0,0,0,0.12);
+      margin-top: 8px;
+    }
+    .badge {
+      display: inline-block;
+      padding: 2px 6px;
+      border-radius: 999px;
+      font-size: 11px;
+      background: rgba(0,0,0,0.06);
+    }
+    .tabs {
+      display: flex;
+      gap: 6px;
+      margin-top: 8px;
+      margin-bottom: 4px;
+    }
+    .tab-btn {
+      flex: 1;
+      text-align: center;
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    .tab-btn.inactive {
+      background: linear-gradient(135deg, #f1f3f6, #e2e6ec);
+      color: var(--tg-theme-hint-color, #555);
+      box-shadow: none;
+    }
+    .sched-btn {
+      min-width: 0;
+      font-size: 13px;
+    }
+    .sched-btn.active {
+      filter: brightness(1.05);
+      box-shadow: 0 3px 10px rgba(0,0,0,0.18);
+    }
+    .hidden {
+      display: none !important;
+    }
+    /* ── Редактор уроков ── */
+    .lesson-entry {
+      display: flex;
+      align-items: stretch;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    /* Левая полоска: [+] номер [−] */
+    .lesson-btns {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0;
+      flex-shrink: 0;
+      width: 28px;
+      padding: 2px 0;
+    }
+    .lesson-index {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--tg-theme-hint-color, #999);
+      line-height: 1;
+      user-select: none;
+    }
+    .lesson-btn-add,
+    .lesson-btn-remove {
+      padding: 0;
+      width: 26px;
+      height: 26px;
+      min-width: 0;
+      line-height: 26px;
+      text-align: center;
+      box-shadow: none;
+      border-radius: 50%;
+      border: none;
+      color: #ffffff;
+      font-size: 16px;
+      flex-shrink: 0;
+      margin: 0;
+    }
+    .lesson-btn-add  { background: linear-gradient(135deg, #24b34b, #4edc7e); }
+    .lesson-btn-remove { background: linear-gradient(135deg, #e24545, #ff8a7a); }
+    /* Карточка урока */
+    .lesson-row {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      background: var(--tg-theme-secondary-bg-color, #f5f5f5);
+      border: 1px solid rgba(0,0,0,0.07);
+      box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+    }
+    .lesson-row-top {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .lesson-times {
+      display: flex;
+      gap: 6px;
+      flex: 1 1 0;
+    }
+    .lesson-times input {
+      flex: 1 1 0;
+      min-width: 0;
+      padding: 4px 6px;
+      font-size: 13px;
+      height: 32px;
+      margin-top: 0;
+      text-align: center;
+    }
+    .lesson-times-sep {
+      align-self: center;
+      font-size: 13px;
+      color: var(--tg-theme-hint-color, #aaa);
+      flex-shrink: 0;
+    }
+    .lesson-row-bottom {
+      display: flex;
+      gap: 6px;
+    }
+    .lesson-row-bottom .lesson-subject-wrap {
+      flex: 1 1 0;
+      min-width: 0;
+    }
+    .lesson-row-bottom .lesson-room-wrap {
+      flex: 0 0 72px;
+    }
+    .lesson-row-bottom input {
+      padding: 5px 8px;
+      font-size: 13px;
+      height: 34px;
+      margin-top: 0;
+    }
+    /* Подписи полей внутри карточки */
+    .lesson-field-label {
+      font-size: 10px;
+      color: var(--tg-theme-hint-color, #aaa);
+      margin-bottom: 2px;
+      padding-left: 2px;
+    }
+    /* ── Кнопки расписания ── */
+    #schedule-card {
+      padding: 0;
+      background: none;
+      box-shadow: none;
+    }
+    .sched-main-row {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    .sched-main-btn {
+      flex: 1 1 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 5px;
+      padding: 12px 4px;
+      border-radius: 14px;
+      background: linear-gradient(145deg, #4e8cff, #8f6bff);
+      color: #fff;
+      font-size: 13px;
+      font-weight: 600;
+      box-shadow: 0 3px 10px rgba(100,80,255,0.22);
+      border: none;
+      cursor: pointer;
+      transition: transform 0.08s, box-shadow 0.08s;
+      margin: 0;
+    }
+    .sched-main-btn:active {
+      transform: scale(0.96);
+      box-shadow: 0 1px 4px rgba(100,80,255,0.18);
+    }
+    .sched-main-btn.active {
+      background: linear-gradient(145deg, #3a76f0, #7a52f0);
+      box-shadow: 0 4px 14px rgba(100,80,255,0.35);
+    }
+    .sched-btn-icon { font-size: 20px; line-height: 1; }
+    .sched-btn-label { font-size: 12px; }
+    .sched-chips-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-bottom: 8px;
+    }
+    .sched-chip {
+      padding: 5px 12px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 500;
+      background: var(--tg-theme-secondary-bg-color, #f0f0f0);
+      color: var(--tg-theme-hint-color, #555);
+      border: 1px solid rgba(0,0,0,0.07);
+      box-shadow: none;
+      margin: 0;
+      cursor: pointer;
+      transition: background 0.12s, color 0.12s;
+    }
+    .sched-chip.active {
+      background: linear-gradient(135deg, #4e8cff, #8f6bff);
+      color: #fff;
+      border-color: transparent;
+      box-shadow: 0 2px 8px rgba(100,80,255,0.25);
+    }
+    /* ── Подписка ── */
+    #sub-card { padding: 12px; }
+    .sub-status-block {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 16px;
+      border-radius: 16px;
+      background: linear-gradient(135deg, rgba(78,140,255,0.10), rgba(143,107,255,0.10));
+      border: 1px solid rgba(122,111,255,0.18);
+      margin-bottom: 16px;
+    }
+    .sub-status-left {
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, #4e8cff22, #8f6bff33);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+    .sub-status-icon { font-size: 22px; }
+    .sub-status-right { flex: 1; min-width: 0; }
+    .sub-status-title {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--tg-theme-text-color, #000);
+      margin-bottom: 2px;
+    }
+    .sub-status-text {
+      font-size: 12px;
+      color: var(--tg-theme-hint-color, #777);
+      line-height: 1.4;
+    }
+    .sub-settings {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+    .sub-field {
+      flex: 1 1 0;
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+    .sub-label {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--tg-theme-hint-color, #888);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      padding-left: 3px;
+    }
+    .sub-input {
+      width: 100%;
+      box-sizing: border-box;
+      height: 44px;
+      padding: 8px 12px;
+      border-radius: 12px;
+      border: 1.5px solid rgba(0,0,0,0.10);
+      font-size: 15px;
+      background: var(--tg-theme-secondary-bg-color, #f5f5f5);
+      color: var(--tg-theme-text-color, #000);
+      margin: 0;
+    }
+    .sub-actions { display: flex; gap: 8px; }
+    .sub-btn-save {
+      flex: 1;
+      padding: 13px;
+      font-size: 14px;
+      font-weight: 700;
+      border-radius: 14px;
+      background: linear-gradient(135deg, #4e8cff, #8f6bff);
+      color: #fff;
+      border: none;
+      box-shadow: 0 3px 10px rgba(100,80,255,0.25);
+      cursor: pointer;
+      margin: 0;
+    }
+    .sub-btn-remove {
+      flex: 0 0 auto;
+      padding: 13px 18px;
+      font-size: 13px;
+      font-weight: 600;
+      border-radius: 14px;
+      background: rgba(220,50,50,0.07);
+      color: #c0392b;
+      border: 1.5px solid rgba(220,50,50,0.18);
+      box-shadow: none;
+      cursor: pointer;
+      margin: 0;
+    }
+    /* ── Управление админами ── */
+    .admins-section { margin-top: 16px; }
+    .admins-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+    .admins-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 12px;
+      border-radius: 10px;
+      background: var(--tg-theme-secondary-bg-color, #f5f5f5);
+      border: 1px solid rgba(0,0,0,0.06);
+    }
+    .admins-item-info { flex: 1; min-width: 0; }
+    .admins-item-id {
+      font-size: 12px;
+      font-weight: 600;
+      font-family: ui-monospace, monospace;
+    }
+    .admins-item-badge {
+      font-size: 10px;
+      padding: 2px 7px;
+      border-radius: 999px;
+      background: rgba(122,111,255,0.13);
+      color: #7a6fff;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+    .admins-item-del {
+      padding: 5px 11px;
+      font-size: 12px;
+      border-radius: 999px;
+      background: linear-gradient(135deg, #e24545, #ff8a7a);
+      color: #fff;
+      border: none;
+      cursor: pointer;
+      box-shadow: none;
+      min-width: 0;
+      flex-shrink: 0;
+      margin: 0;
+    }
+    .admins-empty {
+      font-size: 13px;
+      color: var(--tg-theme-hint-color, #888);
+      padding: 4px 2px;
+    }
+    .admins-add-row {
+      display: flex;
+      gap: 8px;
+      align-items: flex-end;
+    }
+    .admins-add-row .sub-field { flex: 1; }
+    .admins-add-row button { flex-shrink: 0; height: 42px; padding: 0 16px; border-radius: 10px; }
+    /* ── Fullscreen редакторы ── */
+    .admin-fullscreen {
+      display: flex;
+      flex-direction: column;
+      position: fixed;
+      inset: 0;
+      z-index: 100;
+      background: var(--tg-theme-bg-color, #fff);
+      padding: 0;
+    }
+    .admin-fullscreen.hidden { display: none !important; }
+    .editor-topbar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 12px 8px;
+      border-bottom: 1px solid rgba(0,0,0,0.08);
+      background: var(--tg-theme-secondary-bg-color, #f5f5f5);
+      flex-shrink: 0;
+    }
+    .editor-back-btn {
+      padding: 6px 12px;
+      font-size: 13px;
+      flex-shrink: 0;
+    }
+    .editor-topbar-right {
+      display: flex;
+      gap: 6px;
+      flex: 1;
+      min-width: 0;
+      justify-content: flex-end;
+    }
+    .editor-topbar-right input,
+    .editor-topbar-right select {
+      width: auto;
+      flex: 1 1 0;
+      min-width: 0;
+      max-width: 160px;
+    }
+    .editor-scroll {
+      flex: 1;
+      overflow-y: auto;
+      padding: 10px 12px;
+    }
+    .editor-textarea {
+      flex: 1;
+      width: 100%;
+      box-sizing: border-box;
+      resize: none;
+      border: none;
+      border-radius: 0;
+      padding: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 13px;
+      line-height: 1.6;
+      background: var(--tg-theme-bg-color, #fff);
+      color: var(--tg-theme-text-color, #000);
+      outline: none;
+      margin: 0;
+      height: auto;
+    }
+    .editor-bottombar {
+      display: flex;
+      gap: 8px;
+      padding: 10px 12px;
+      border-top: 1px solid rgba(0,0,0,0.08);
+      background: var(--tg-theme-secondary-bg-color, #f5f5f5);
+      flex-shrink: 0;
+    }
+    /* ── Групповые подписки ── */
+    .sub-section-divider {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--tg-theme-hint-color, #888);
+      margin: 16px 0 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .sub-section-divider::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: rgba(0,0,0,0.08);
+    }
+    .sub-group-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-bottom: 10px;
+    }
+    .sub-group-empty {
+      font-size: 13px;
+      color: var(--tg-theme-hint-color, #888);
+      padding: 4px 2px;
+    }
+    .sub-group-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 12px;
+      border-radius: 10px;
+      background: var(--tg-theme-secondary-bg-color, #f5f5f5);
+      border: 1px solid rgba(0,0,0,0.06);
+    }
+    .sub-group-item-info { flex: 1; min-width: 0; }
+    .sub-group-item-id {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--tg-theme-hint-color, #888);
+      margin-bottom: 1px;
+      font-family: ui-monospace, monospace;
+    }
+    .sub-group-item-time { font-size: 13px; font-weight: 500; }
+    .sub-group-item-del {
+      padding: 5px 11px;
+      font-size: 12px;
+      border-radius: 999px;
+      background: linear-gradient(135deg, #e24545, #ff8a7a);
+      color: #fff;
+      border: none;
+      cursor: pointer;
+      box-shadow: none;
+      min-width: 0;
+      flex-shrink: 0;
+      margin: 0;
+    }
+    .sub-group-form { display: flex; flex-direction: column; gap: 8px; }
+    .sub-group-inputs {
+      display: flex;
+      gap: 8px;
+    }
+    .sub-group-inputs .sub-field:first-child { flex: 2 1 0; }
+    .sub-group-inputs .sub-field { flex: 1 1 0; min-width: 0; }
+    @media (max-width: 480px) {
+      h1 { font-size: 18px; }
+      h2 { font-size: 14px; }
+      button { font-size: 13px; }
+    }
+  </style>
+</head>
+<body>
+  <h1>Школьное расписание</h1>
+  <div id="status">Загрузка...</div>
+
+  <div class="tabs">
+    <button id="tab-btn-schedule" class="tab-btn">Расписание</button>
+    <button id="tab-btn-sub" class="tab-btn inactive">Подписка</button>
+    <button id="tab-btn-admin" class="tab-btn inactive">Админка</button>
+  </div>
+
+  <div id="schedule-card">
+    <!-- Три главных кнопки -->
+    <div class="sched-main-row">
+      <button class="sched-main-btn" data-type="today">
+        <span class="sched-btn-icon">📅</span>
+        <span class="sched-btn-label">Сегодня</span>
+      </button>
+      <button class="sched-main-btn" data-type="tomorrow">
+        <span class="sched-btn-icon">🌅</span>
+        <span class="sched-btn-label">Завтра</span>
+      </button>
+      <button class="sched-main-btn" data-type="week">
+        <span class="sched-btn-icon">📆</span>
+        <span class="sched-btn-label">Неделя</span>
+      </button>
+    </div>
+    <!-- Дополнительные чипсы: Основное + Суббота в одном ряду -->
+    <div class="sched-chips-row" id="schedule-secondary-row">
+      <button id="btn-week-base" class="sched-chip" data-type="week_base">Основное</button>
+      <button id="btn-saturday" class="sched-chip" data-type="saturday">Суббота</button>
+    </div>
+    <!-- Профили субботы (отдельная строка, скрывается если нет профилей) -->
+    <div id="schedule-saturday-row" class="sched-chips-row">
+      <button id="btn-sat-prof-1" class="sched-chip" data-type="sat_profile:Физмат">Физмат</button>
+      <button id="btn-sat-prof-2" class="sched-chip" data-type="sat_profile:Биохим">Биохим</button>
+      <button id="btn-sat-prof-3" class="sched-chip" data-type="sat_profile:Инфотех_1">Инфотех 1</button>
+      <button id="btn-sat-prof-4" class="sched-chip" data-type="sat_profile:Инфотех_2">Инфотех 2</button>
+      <button id="btn-sat-prof-5" class="sched-chip" data-type="sat_profile:Общеобразовательный_3">Общеобр. 3</button>
+    </div>
+    <div id="schedule-box"></div>
+  </div>
+
+  <div class="card hidden" id="sub-card">
+    <!-- Статус подписки -->
+    <div id="sub-status-block" class="sub-status-block">
+      <div class="sub-status-left">
+        <span id="sub-status-icon" class="sub-status-icon">🔕</span>
+      </div>
+      <div class="sub-status-right">
+        <div class="sub-status-title">Уведомления о расписании</div>
+        <div id="sub-info" class="sub-status-text">Загрузка...</div>
+      </div>
+    </div>
+    <!-- Настройки -->
+    <div class="sub-settings">
+      <div class="sub-field">
+        <label class="sub-label">Время отправки</label>
+        <input id="sub-time" type="time" class="sub-input" />
+      </div>
+      <div class="sub-field">
+        <label class="sub-label">Расписание на</label>
+        <select id="sub-day-type" class="sub-input">
+          <option value="today">Сегодня</option>
+          <option value="tomorrow">Завтра</option>
+        </select>
+      </div>
+    </div>
+    <div class="sub-actions">
+      <button id="sub-save" class="sub-btn-save">🔔 Сохранить</button>
+      <button id="sub-remove" class="sub-btn-remove">Отключить</button>
+    </div>
+
+    <!-- Групповые подписки — только для админов -->
+    <div id="sub-group-section" class="hidden">
+      <div class="sub-section-divider">Групповые чаты</div>
+      <div id="sub-group-list" class="sub-group-list">
+        <div class="sub-group-empty">Загрузка...</div>
+      </div>
+      <div class="sub-group-form">
+        <div class="sub-group-inputs">
+          <div class="sub-field">
+            <label class="sub-label">Chat ID группы</label>
+            <input id="sub-group-chatid" type="text" class="sub-input" placeholder="-100123456789" />
+          </div>
+          <div class="sub-field">
+            <label class="sub-label">Время</label>
+            <input id="sub-group-time" type="time" class="sub-input" />
+          </div>
+          <div class="sub-field">
+            <label class="sub-label">На</label>
+            <select id="sub-group-daytype" class="sub-input">
+              <option value="today">Сегодня</option>
+              <option value="tomorrow">Завтра</option>
+            </select>
+          </div>
+        </div>
+        <button id="sub-group-save" style="width:100%;">➕ Добавить подписку для группы</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card hidden" id="admin-card">
+    <div id="admin-mode-buttons">
+      <div class="row">
+        <button id="admin-type-base">Основное</button>
+        <button id="admin-type-temp" class="secondary">Временное</button>
+      </div>
+      <div class="row" style="margin-top:6px;">
+        <button id="admin-mode-day">Редактировать день</button>
+        <button id="admin-mode-week" class="secondary">Редактировать неделю</button>
+      </div>
+
+      <!-- Управление админами — только для суперадмина -->
+      <div id="admins-section" class="hidden admins-section">
+        <div class="sub-section-divider">Администраторы</div>
+        <div id="admins-list" class="admins-list">
+          <div class="admins-empty">Загрузка...</div>
+        </div>
+        <div class="admins-add-row">
+          <div class="sub-field">
+            <label class="sub-label">User ID нового админа</label>
+            <input id="admins-add-input" type="text" class="sub-input" placeholder="123456789" />
+          </div>
+          <button id="admins-add-btn">➕ Добавить</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Редактор дня -->
+    <div id="admin-day-editor" class="hidden admin-fullscreen">
+      <div class="editor-topbar">
+        <button id="admin-day-cancel" class="secondary editor-back-btn">← Назад</button>
+        <div class="editor-topbar-right">
+          <div class="row" id="admin-day-date-wrap" style="margin:0;">
+            <input id="admin-day-date" type="date" style="height:32px;margin:0;font-size:12px;" />
+          </div>
+          <select id="admin-day-select" style="height:32px;margin:0;font-size:12px;width:auto;">
+            <option value="Понедельник">Понедельник</option>
+            <option value="Вторник">Вторник</option>
+            <option value="Среда">Среда</option>
+            <option value="Четверг">Четверг</option>
+            <option value="Пятница">Пятница</option>
+            <option value="Суббота">Суббота</option>
+            <option value="Воскресенье">Воскресенье</option>
+          </select>
+        </div>
+      </div>
+      <div class="editor-scroll">
+        <div id="admin-lesson-rows"></div>
+      </div>
+      <div class="editor-bottombar">
+        <button id="admin-day-save" style="flex:1;">Сохранить день</button>
+      </div>
+    </div>
+
+    <!-- Редактор недели -->
+    <div id="admin-week-editor" class="hidden admin-fullscreen">
+      <div class="editor-topbar">
+        <button id="admin-week-cancel" class="secondary editor-back-btn">← Назад</button>
+        <button id="admin-week-load" class="secondary" style="font-size:12px;padding:6px 10px;">📥 Загрузить</button>
+      </div>
+      <textarea id="admin-week-text" class="editor-textarea" placeholder="Понедельник:&#10;08:00-08:40 Математика/211&#10;&#10;Вторник:&#10;08:00-08:40 Русский яз./305"></textarea>
+      <div class="editor-bottombar">
+        <button id="admin-week-save" style="flex:1;">Сохранить неделю</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const tg = window.Telegram && window.Telegram.WebApp;
+    if (tg) {
+      tg.ready();
+      tg.expand();
+    }
+
+    const statusEl = document.getElementById('status');
+    const scheduleBox = document.getElementById('schedule-box');
+    const subInfo = document.getElementById('sub-info');
+    const subTime = document.getElementById('sub-time');
+    const subDayType = document.getElementById('sub-day-type');
+    const subSave = document.getElementById('sub-save');
+    const subRemove = document.getElementById('sub-remove');
+    const adminCard = document.getElementById('admin-card');
+    const adminModeButtons = document.getElementById('admin-mode-buttons');
+    const adminDayEditor = document.getElementById('admin-day-editor');
+    const adminWeekEditor = document.getElementById('admin-week-editor');
+    const adminDaySelect = document.getElementById('admin-day-select');
+    const adminDaySave = document.getElementById('admin-day-save');
+    const adminDayCancel = document.getElementById('admin-day-cancel');
+    const adminWeekText = document.getElementById('admin-week-text');
+    const adminWeekSave = document.getElementById('admin-week-save');
+    const adminWeekCancel = document.getElementById('admin-week-cancel');
+    const adminDayDate = document.getElementById('admin-day-date');
+    const adminDayDateWrap = document.getElementById('admin-day-date-wrap');
+    const adminLessonRows = document.getElementById('admin-lesson-rows');
+    const adminTypeBase = document.getElementById('admin-type-base');
+    const adminTypeTemp = document.getElementById('admin-type-temp');
+
+    let adminType = 'base';
+    let isSuperAdmin = false;
+
+    function createLessonRow(data) {
+      // Внешняя обёртка: [полоска управления] + [карточка урока]
+      const entry = document.createElement('div');
+      entry.className = 'lesson-entry';
+
+      // --- Левая полоска: [+] номер [−] ---
+      const btnsDiv = document.createElement('div');
+      btnsDiv.className = 'lesson-btns';
+
+      const plusBtn = document.createElement('button');
+      plusBtn.textContent = '+';
+      plusBtn.className = 'lesson-btn-add';
+      plusBtn.title = 'Добавить урок после';
+      plusBtn.addEventListener('click', () => {
+        const snapshot = {
+          start: entry.querySelector('.lesson-start').value,
+          end: entry.querySelector('.lesson-end').value,
+          subject: '',
+          room: '',
+        };
+        const newEntry = createLessonRow(snapshot);
+        adminLessonRows.insertBefore(newEntry, entry.nextSibling);
+        renumberLessonRows();
+      });
+
+      const numLabel = document.createElement('span');
+      numLabel.className = 'lesson-index';
+      numLabel.textContent = '1';
+
+      const minusBtn = document.createElement('button');
+      minusBtn.textContent = '\u2212';
+      minusBtn.className = 'lesson-btn-remove';
+      minusBtn.title = 'Удалить урок';
+      minusBtn.addEventListener('click', () => {
+        if (adminLessonRows.children.length > 1) {
+          adminLessonRows.removeChild(entry);
+          renumberLessonRows();
+        }
+      });
+
+      btnsDiv.appendChild(plusBtn);
+      btnsDiv.appendChild(numLabel);
+      btnsDiv.appendChild(minusBtn);
+
+      // --- Карточка урока ---
+      const row = document.createElement('div');
+      row.className = 'lesson-row';
+
+      // Строка 1: время начала → время конца
+      const topDiv = document.createElement('div');
+      topDiv.className = 'lesson-row-top';
+
+      const timesDiv = document.createElement('div');
+      timesDiv.className = 'lesson-times';
+
+      const startInput = document.createElement('input');
+      startInput.type = 'time';
+      startInput.className = 'lesson-start';
+      startInput.value = data.start || '';
+      startInput.title = 'Начало';
+
+      const sep = document.createElement('span');
+      sep.className = 'lesson-times-sep';
+      sep.textContent = '\u2192';
+
+      const endInput = document.createElement('input');
+      endInput.type = 'time';
+      endInput.className = 'lesson-end';
+      endInput.value = data.end || '';
+      endInput.title = 'Конец';
+
+      timesDiv.appendChild(startInput);
+      timesDiv.appendChild(sep);
+      timesDiv.appendChild(endInput);
+      topDiv.appendChild(timesDiv);
+
+      // Строка 2: предмет + кабинет с подписями
+      const bottomDiv = document.createElement('div');
+      bottomDiv.className = 'lesson-row-bottom';
+
+      const subjWrap = document.createElement('div');
+      subjWrap.className = 'lesson-subject-wrap';
+      const subjLabel = document.createElement('div');
+      subjLabel.className = 'lesson-field-label';
+      subjLabel.textContent = '\u041f\u0440\u0435\u0434\u043c\u0435\u0442';
+      const subjInput = document.createElement('input');
+      subjInput.placeholder = '\u041d\u0430\u0437\u0432\u0430\u043d\u0438\u0435';
+      subjInput.className = 'lesson-subject';
+      subjInput.value = data.subject || '';
+      subjWrap.appendChild(subjLabel);
+      subjWrap.appendChild(subjInput);
+
+      const roomWrap = document.createElement('div');
+      roomWrap.className = 'lesson-room-wrap';
+      const roomLabel = document.createElement('div');
+      roomLabel.className = 'lesson-field-label';
+      roomLabel.textContent = '\u041a\u0430\u0431\u0438\u043d\u0435\u0442';
+      const roomInput = document.createElement('input');
+      roomInput.placeholder = '\u2014';
+      roomInput.className = 'lesson-room';
+      roomInput.value = data.room || '';
+      roomWrap.appendChild(roomLabel);
+      roomWrap.appendChild(roomInput);
+
+      bottomDiv.appendChild(subjWrap);
+      bottomDiv.appendChild(roomWrap);
+
+      row.appendChild(topDiv);
+      row.appendChild(bottomDiv);
+
+      entry.appendChild(btnsDiv);
+      entry.appendChild(row);
+
+      return entry;
+    }
+
+    function renumberLessonRows() {
+      Array.from(adminLessonRows.children).forEach((entry, idx) => {
+        const label = entry.querySelector('.lesson-index');
+        if (label) label.textContent = idx + 1;
+      });
+    }
+
+    function fillLessonRowsFromLines(lines) {
+      adminLessonRows.innerHTML = '';
+      if (!lines || !lines.length) {
+        const defaults = [
+          ['08:00', '08:40'],
+          ['08:50', '09:30'],
+          ['09:50', '10:30'],
+          ['10:50', '11:30'],
+          ['11:40', '12:20'],
+        ];
+        defaults.forEach((t) => {
+          const row = createLessonRow({ start: t[0], end: t[1], subject: '', room: '' });
+          adminLessonRows.appendChild(row);
+        });
+        renumberLessonRows();
+        return;
+      }
+      lines.forEach((line) => {
+        const raw = (line || '').trim();
+        if (!raw) return;
+        let start = '', end = '', subject = '', room = '';
+        const m = raw.match(/^(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})\s+(.+)$/);
+        let rest = raw;
+        if (m) {
+          start = m[1];
+          end = m[2];
+          rest = m[3];
+        }
+        if (rest.includes('/')) {
+          const parts = rest.split('/');
+          subject = parts[0].trim();
+          room = parts.slice(1).join('/').trim();
+        } else {
+          subject = rest.trim();
+        }
+        const row = createLessonRow({ start, end, subject, room });
+        adminLessonRows.appendChild(row);
+      });
+      renumberLessonRows();
+    }
+
+    async function reloadAdminDay() {
+      const day = adminDaySelect.value;
+      const date = adminDayDate.value || null;
+      const data = await api('/api/admin/day_get', { day, mode: adminType, date });
+      fillLessonRowsFromLines(data.lessons || []);
+    }
+
+    const tabBtnSchedule = document.getElementById('tab-btn-schedule');
+    const tabBtnSub = document.getElementById('tab-btn-sub');
+    const tabBtnAdmin = document.getElementById('tab-btn-admin');
+    const scheduleCard = document.getElementById('schedule-card');
+    const subCard = document.getElementById('sub-card');
+    const scheduleSaturdayRow = document.getElementById('schedule-saturday-row');
+
+    let isAdmin = false;
+
+    function setStatus(text, isError) {
+      statusEl.textContent = text || '';
+      statusEl.style.color = isError ? '#d33' : 'var(--tg-theme-hint-color, #888)';
+    }
+
+    function setTab(tab) {
+      tabBtnSchedule.classList.toggle('inactive', tab !== 'schedule');
+      tabBtnSub.classList.toggle('inactive', tab !== 'sub');
+      tabBtnAdmin.classList.toggle('inactive', tab !== 'admin');
+      scheduleCard.classList.toggle('hidden', tab !== 'schedule');
+      subCard.classList.toggle('hidden', tab !== 'sub');
+      // Админ‑карточка видна только на вкладке "Админка" и только для админов
+      const showAdmin = tab === 'admin' && isAdmin;
+      adminCard.classList.toggle('hidden', !showAdmin);
+    }
+
+    async function api(path, payload) {
+      try {
+        const body = Object.assign({}, payload || {}, {
+          init_data: tg ? tg.initData : '',
+          user: tg && tg.initDataUnsafe && tg.initDataUnsafe.user ? tg.initDataUnsafe.user : null,
+        });
+        const res = await fetch(path, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          throw new Error(data.error || 'Ошибка запроса');
+        }
+        return data;
+      } catch (e) {
+        console.error(e);
+        setStatus(e.message || 'Ошибка связи с сервером', true);
+        throw e;
+      }
+    }
+
+    async function loadMe() {
+      setStatus('Загрузка данных пользователя...');
+      const data = await api('/api/me', {});
+      const subIcon = document.getElementById('sub-status-icon');
+      if (data.subscription) {
+        const dayLabel = data.subscription.day_type === 'tomorrow' ? 'завтра' : 'сегодня';
+        subInfo.textContent = 'Уведомление каждый день в ' + data.subscription.time + ' — расписание на ' + dayLabel;
+        if (subIcon) subIcon.textContent = '🔔';
+        subTime.value = data.subscription.time;
+        subDayType.value = data.subscription.day_type || 'today';
+      } else {
+        subInfo.textContent = 'Подписка не настроена. Выбери время и нажми «Сохранить».';
+        if (subIcon) subIcon.textContent = '🔕';
+      }
+      isAdmin = !!data.is_admin;
+      isSuperAdmin = !!data.is_superadmin;
+      // Управление видимостью: кнопка «Суббота» всегда в ряду с «Основное»
+      // Строка профилей показывается только если есть профили
+      const btnSaturday = document.getElementById('btn-saturday');
+      if (!data.has_saturday) {
+        if (btnSaturday) btnSaturday.style.display = 'none';
+        scheduleSaturdayRow.style.display = 'none';
+      } else if (!data.has_saturday_profiles) {
+        if (btnSaturday) btnSaturday.style.display = '';
+        scheduleSaturdayRow.style.display = 'none';
+      } else {
+        if (btnSaturday) btnSaturday.style.display = '';
+        scheduleSaturdayRow.style.display = 'flex';
+      }
+      setStatus('Готово');
+      if (isAdmin) {
+        await loadGroupSubscriptions();
+      }
+      if (isSuperAdmin) {
+        const adminsSection = document.getElementById('admins-section');
+        if (adminsSection) adminsSection.classList.remove('hidden');
+        await loadAdminsList();
+      }
+    }
+
+    async function loadSchedule(type) {
+      setStatus('Загрузка расписания...');
+      const data = await api('/api/schedule', { type });
+      scheduleBox.innerHTML = data.html || '';
+      setStatus('');
+      // подсветка активной кнопки
+      document.querySelectorAll('button[data-type]').forEach((btn) => {
+        btn.classList.toggle('active', btn.getAttribute('data-type') === type);
+      });
+    }
+
+    async function saveSubscription() {
+      const time = subTime.value;
+      const dayType = subDayType.value;
+      if (!time) {
+        setStatus('Укажи время в формате HH:MM', true);
+        return;
+      }
+      setStatus('Сохранение подписки...');
+      await api('/api/subscribe', { time, day_type: dayType });
+      setStatus('Подписка сохранена');
+      await loadMe();
+    }
+
+    async function removeSubscription() {
+      setStatus('Отключение подписки...');
+      await api('/api/unsubscribe', {});
+      setStatus('Подписка отключена');
+      await loadMe();
+    }
+
+    async function saveAdminWeek() {
+      const text = adminWeekText.value || '';
+      setStatus('Сохранение расписания на неделю...');
+      await api('/api/admin/week', { week_text: text, mode: adminType });
+      setStatus('Расписание обновлено');
+    }
+
+    async function saveAdminDay() {
+      const day = adminDaySelect.value;
+      const date = adminDayDate.value || null;
+      // собираем строки занятий из фиксированных слотов
+      const lines = [];
+      const rows = Array.from(adminLessonRows.querySelectorAll('.lesson-entry'));
+      const parsed = [];
+      rows.forEach((row) => {
+        const subjInput = row.querySelector('.lesson-subject');
+        const roomInput = row.querySelector('.lesson-room');
+        const startInput = row.querySelector('.lesson-start');
+        const endInput = row.querySelector('.lesson-end');
+        const subject = (subjInput.value || '').trim();
+        const room = (roomInput.value || '').trim();
+        const start = (startInput && startInput.value) || '';
+        const end = (endInput && endInput.value) || '';
+        if (!subject) {
+          return;
+        }
+        const roomPart = room ? '/' + room : '';
+        parsed.push({
+          start,
+          end,
+          line: `${start || ''}-${end || ''} ${subject}${roomPart}`.trim(),
+        });
+      });
+      parsed
+        .filter((p) => p.start)
+        .sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0))
+        .forEach((p) => lines.push(p.line));
+      const text = lines.join('\\n');
+      setStatus('Сохранение расписания дня...');
+      await api('/api/admin/day', { day, lessons_text: text, mode: adminType, date });
+      setStatus('Расписание дня обновлено');
+    }
+
+    document.querySelectorAll('button[data-type]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const t = btn.getAttribute('data-type');
+        loadSchedule(t);
+      });
+    });
+    subSave.addEventListener('click', saveSubscription);
+    subRemove.addEventListener('click', removeSubscription);
+
+    // ── Групповые подписки (только для админов) ──
+    async function loadGroupSubscriptions() {
+      const section = document.getElementById('sub-group-section');
+      if (!section) return;
+      section.classList.remove('hidden');
+      const list = document.getElementById('sub-group-list');
+      list.innerHTML = '<div class="sub-group-empty">Загрузка...</div>';
+      try {
+        const data = await api('/api/admin/subscriptions_list', {});
+        list.innerHTML = '';
+        if (!data.subscriptions || !data.subscriptions.length) {
+          list.innerHTML = '<div class="sub-group-empty">Нет активных групповых подписок</div>';
+          return;
+        }
+        data.subscriptions.forEach(sub => {
+          const dayLabel = sub.day_type === 'tomorrow' ? 'завтра' : 'сегодня';
+          const item = document.createElement('div');
+          item.className = 'sub-group-item';
+          item.innerHTML =
+            '<div class="sub-group-item-info">' +
+              '<div class="sub-group-item-id">ID: ' + sub.chat_id + '</div>' +
+              '<div class="sub-group-item-time">\u23f0 ' + sub.time + ' \u00b7 ' + dayLabel + '</div>' +
+            '</div>' +
+            '<button class="sub-group-item-del">\u2715</button>';
+          item.querySelector('.sub-group-item-del').addEventListener('click', async () => {
+            try {
+              await api('/api/admin/unsubscribe_chat', { chat_id: sub.chat_id });
+              await loadGroupSubscriptions();
+            } catch(e) {}
+          });
+          list.appendChild(item);
+        });
+      } catch(e) {
+        list.innerHTML = '<div class="sub-group-empty">Ошибка загрузки</div>';
+      }
+    }
+
+    document.getElementById('sub-group-save').addEventListener('click', async () => {
+      const chatIdInput = document.getElementById('sub-group-chatid');
+      const timeInput   = document.getElementById('sub-group-time');
+      const dayTypeInput = document.getElementById('sub-group-daytype');
+      const chatId = (chatIdInput.value || '').trim();
+      const time   = timeInput.value;
+      const dayType = dayTypeInput.value;
+      if (!chatId) { setStatus('Укажи Chat ID группы', true); return; }
+      if (!time)   { setStatus('Укажи время', true); return; }
+      if (!/^-?\d+$/.test(chatId)) { setStatus('Chat ID должен быть числом, например -100123456789', true); return; }
+      try {
+        await api('/api/admin/subscribe_chat', { chat_id: chatId, time, day_type: dayType });
+        chatIdInput.value = '';
+        setStatus('Подписка для группы добавлена');
+        await loadGroupSubscriptions();
+      } catch(e) {}
+    });
+
+    // ── Управление админами (только суперадмин) ──
+    async function loadAdminsList() {
+      const list = document.getElementById('admins-list');
+      if (!list) return;
+      list.innerHTML = '<div class="admins-empty">Загрузка...</div>';
+      try {
+        const data = await api('/api/admin/admins_list', {});
+        list.innerHTML = '';
+        if (!data.admins || !data.admins.length) {
+          list.innerHTML = '<div class="admins-empty">Нет дополнительных администраторов</div>';
+          return;
+        }
+        data.admins.forEach(uid => {
+          const item = document.createElement('div');
+          item.className = 'admins-item';
+          item.innerHTML =
+            '<div class="admins-item-info">' +
+              '<div class="admins-item-id">' + uid + '</div>' +
+            '</div>' +
+            '<span class="admins-item-badge">админ</span>' +
+            '<button class="admins-item-del" data-uid="' + uid + '">\u2715</button>';
+          item.querySelector('.admins-item-del').addEventListener('click', async () => {
+            try {
+              await api('/api/admin/admin_remove', { target_user_id: uid });
+              await loadAdminsList();
+            } catch(e) {}
+          });
+          list.appendChild(item);
+        });
+      } catch(e) {
+        list.innerHTML = '<div class="admins-empty">Ошибка загрузки</div>';
+      }
+    }
+
+    document.getElementById('admins-add-btn').addEventListener('click', async () => {
+      const input = document.getElementById('admins-add-input');
+      const uid = (input.value || '').trim();
+      if (!uid || !/^\d+$/.test(uid)) { setStatus('User ID должен быть числом', true); return; }
+      try {
+        await api('/api/admin/admin_add', { target_user_id: uid });
+        input.value = '';
+        setStatus('Администратор добавлен');
+        await loadAdminsList();
+      } catch(e) {}
+    });
+
+    tabBtnSchedule.addEventListener('click', () => setTab('schedule'));
+    tabBtnSub.addEventListener('click', () => setTab('sub'));
+    tabBtnAdmin.addEventListener('click', () => setTab('admin'));
+
+    adminTypeBase.addEventListener('click', () => {
+      adminType = 'base';
+      adminTypeBase.classList.remove('secondary');
+      adminTypeTemp.classList.add('secondary');
+      adminDayDateWrap.classList.add('hidden');
+      const loadBtn = document.getElementById('admin-week-load');
+      if (loadBtn) loadBtn.textContent = '📥 Загрузить основное';
+      if (!adminDayEditor.classList.contains('hidden')) {
+        reloadAdminDay();
+      }
+    });
+    adminTypeTemp.addEventListener('click', () => {
+      adminType = 'temp';
+      adminTypeTemp.classList.remove('secondary');
+      adminTypeBase.classList.add('secondary');
+      adminDayDateWrap.classList.remove('hidden');
+      const loadBtn = document.getElementById('admin-week-load');
+      if (loadBtn) loadBtn.textContent = '📥 Загрузить текущее';
+      if (!adminDayEditor.classList.contains('hidden')) {
+        reloadAdminDay();
+      }
+    });
+    document.getElementById('admin-mode-day').addEventListener('click', () => {
+      adminModeButtons.classList.add('hidden');
+      adminWeekEditor.classList.add('hidden');
+      adminDayEditor.classList.remove('hidden');
+      // В режиме temp подставляем сегодняшнюю дату если поле пустое
+      if (adminType === 'temp' && !adminDayDate.value) {
+        const today = new Date();
+        adminDayDate.value = today.toISOString().split('T')[0];
+        const ruDays = ['Воскресенье','Понедельник','Вторник','Среда','Четверг','Пятница','Суббота'];
+        adminDaySelect.value = ruDays[today.getDay()];
+      }
+      reloadAdminDay();
+    });
+    document.getElementById('admin-mode-week').addEventListener('click', () => {
+      adminModeButtons.classList.add('hidden');
+      adminDayEditor.classList.add('hidden');
+      adminWeekEditor.classList.remove('hidden');
+    });
+    adminDayCancel.addEventListener('click', () => {
+      adminDayEditor.classList.add('hidden');
+      adminModeButtons.classList.remove('hidden');
+    });
+    adminDaySelect.addEventListener('change', () => {
+      // В режиме temp — синхронизируем дату с выбранным днём недели
+      if (adminType === 'temp') {
+        const ruDays = ['Воскресенье','Понедельник','Вторник','Среда','Четверг','Пятница','Суббота'];
+        const targetIdx = ruDays.indexOf(adminDaySelect.value);
+        if (targetIdx >= 0) {
+          const today = new Date();
+          const delta = targetIdx - today.getDay();
+          const target = new Date(today);
+          target.setDate(today.getDate() + delta);
+          adminDayDate.value = target.toISOString().split('T')[0];
+        }
+      }
+      if (!adminDayEditor.classList.contains('hidden')) {
+        reloadAdminDay();
+      }
+    });
+    adminDayDate.addEventListener('change', () => {
+      // Синхронизируем день недели с выбранной датой
+      if (adminDayDate.value) {
+        const ruDays = ['Воскресенье','Понедельник','Вторник','Среда','Четверг','Пятница','Суббота'];
+        const d = new Date(adminDayDate.value + 'T12:00:00');
+        const dayName = ruDays[d.getDay()];
+        if (adminDaySelect.value !== dayName) {
+          adminDaySelect.value = dayName;
+        }
+      }
+      if (!adminDayEditor.classList.contains('hidden')) {
+        reloadAdminDay();
+      }
+    });
+    adminWeekCancel.addEventListener('click', () => {
+      adminWeekEditor.classList.add('hidden');
+      adminModeButtons.classList.remove('hidden');
+    });
+    document.getElementById('admin-week-load').addEventListener('click', async () => {
+      try {
+        setStatus('Загрузка расписания...');
+        const data = await api('/api/admin/week_get', { mode: adminType });
+        adminWeekText.value = data.week_text || '';
+        setStatus('Расписание загружено — можешь редактировать');
+      } catch (e) {
+        // ошибка уже показана внутри api()
+      }
+    });
+    adminWeekSave.addEventListener('click', saveAdminWeek);
+    adminDaySave.addEventListener('click', saveAdminDay);
+
+    loadMe()
+      .then(() => {
+        setTab('schedule');
+        return loadSchedule('today');
+      })
+      .catch(() => {});
+  </script>
+</body>
+</html>
+"""
+
+
+@app.get("/webapp", response_class=HTMLResponse)
+async def webapp_page():
+    return HTMLResponse(WEBAPP_HTML)
+
+
+@app.post("/api/me")
+async def api_me(request: Request):
+    data = await request.json()
+    raw_user = data.get("user")
+    user = None
+    if isinstance(raw_user, dict) and "id" in raw_user:
+        user = raw_user
+    else:
+        init_data = data.get("init_data", "")
+        user = _get_user_from_init_data(init_data)
+    if not user:
+        return JSONResponse({"ok": False, "error": "bad_init_data"}, status_code=400)
+    user_id = int(user["id"])
+    sub = subscriptions.get(str(user_id))
+    sat_profiles = _nearest_saturday_profiles()
+    has_saturday = bool(sat_profiles)
+    has_saturday_profiles = False
+    if sat_profiles:
+        if len(sat_profiles) == 1 and sat_profiles[0][0] == "Суббота":
+            has_saturday_profiles = False
+        else:
+            has_saturday_profiles = True
+    return JSONResponse(
+        {
+            "ok": True,
+            "user": {"id": user_id, "first_name": user.get("first_name", "")},
+            "is_admin": _is_admin_user_id(user_id),
+            "is_superadmin": _is_superadmin_user_id(user_id),
+            "subscription": sub,
+            "has_saturday": has_saturday,
+            "has_saturday_profiles": has_saturday_profiles,
+        }
+    )
+
+
+@app.post("/api/schedule")
+async def api_schedule(request: Request):
+    data = await request.json()
+    raw_user = data.get("user")
+    user = None
+    if isinstance(raw_user, dict) and "id" in raw_user:
+        user = raw_user
+    else:
+        init_data = data.get("init_data", "")
+        user = _get_user_from_init_data(init_data)
+    if not user:
+        return JSONResponse({"ok": False, "error": "bad_init_data"}, status_code=400)
+    day_type = data.get("type", "today")
+    html_text = _get_schedule_html_for_day_type(day_type)
+    return JSONResponse({"ok": True, "html": html_text})
+
+
+@app.post("/api/subscribe")
+async def api_subscribe(request: Request):
+    data = await request.json()
+    raw_user = data.get("user")
+    user = None
+    if isinstance(raw_user, dict) and "id" in raw_user:
+        user = raw_user
+    else:
+        init_data = data.get("init_data", "")
+        user = _get_user_from_init_data(init_data)
+    if not user:
+        return JSONResponse({"ok": False, "error": "bad_init_data"}, status_code=400)
+    user_id = int(user["id"])
+    time_str = data.get("time", "")
+    parsed = _parse_hhmm(time_str)
+    if not parsed:
+        return JSONResponse({"ok": False, "error": "bad_time"}, status_code=400)
+    hh, mm = parsed
+    t = f"{hh:02d}:{mm:02d}"
+    day_type = data.get("day_type", "today")
+    if day_type not in {"today", "tomorrow"}:
+        day_type = "today"
+    chat_id = user_id
+    subscriptions[str(user_id)] = {"chat_id": chat_id, "time": t, "day_type": day_type}
+    _save_subscriptions_to_disk()
+    _reschedule_user(user_id)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/unsubscribe")
+async def api_unsubscribe(request: Request):
+    data = await request.json()
+    raw_user = data.get("user")
+    user = None
+    if isinstance(raw_user, dict) and "id" in raw_user:
+        user = raw_user
+    else:
+        init_data = data.get("init_data", "")
+        user = _get_user_from_init_data(init_data)
+    if not user:
+        return JSONResponse({"ok": False, "error": "bad_init_data"}, status_code=400)
+    user_id = int(user["id"])
+    subscriptions.pop(str(user_id), None)
+    _save_subscriptions_to_disk()
+    if scheduler is not None:
+        try:
+            scheduler.remove_job(_job_id_for(user_id))
+        except Exception:
+            pass
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/admin/week")
+async def api_admin_week(request: Request):
+    data = await request.json()
+    raw_user = data.get("user")
+    user = None
+    if isinstance(raw_user, dict) and "id" in raw_user:
+        user = raw_user
+    else:
+        init_data = data.get("init_data", "")
+        user = _get_user_from_init_data(init_data)
+    if not user:
+        return JSONResponse({"ok": False, "error": "bad_init_data"}, status_code=400)
+    user_id = int(user["id"])
+    if not _is_admin_user_id(user_id):
+        return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
+    week_text = data.get("week_text", "") or ""
+    mode = (data.get("mode") or "base").strip()
+    week = _parse_week_from_text(week_text)
+    if week is None:
+        return JSONResponse({"ok": False, "error": "bad_format"}, status_code=400)
+
+    if mode == "temp":
+        # Временная неделя: применяем к текущей неделе (пн-вс)
+        now_tz = datetime.now(tz=_get_tz())
+        base_monday_idx = 0
+        today_idx = now_tz.weekday()
+        monday = (now_tz - timedelta(days=today_idx - base_monday_idx)).date()
+        for offset, d_name in enumerate(SCHEDULE_DAYS):
+            if d_name not in week:
+                continue
+            target_date = monday + timedelta(days=offset)
+            key = target_date.isoformat()
+            day_lessons = week[d_name]
+            if isinstance(day_lessons, list):
+                temp_schedule[key] = day_lessons
+        try:
+            _save_temp_schedule_to_disk()
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        week_html = _format_week_text()
+        msg = _truncate_message("📢 Временное расписание на неделю обновлено:\n\n" + week_html)
+        asyncio.create_task(_notify_subscribers(msg))
+    else:
+        for d in SCHEDULE_DAYS:
+            if d in week:
+                schedule[d] = week[d]
+        try:
+            _save_schedule_to_disk()
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        week_html = "\n\n".join(
+            _format_day_table_html(d, schedule.get(d, []))
+            for d in SCHEDULE_DAYS
+            if d in schedule
+        ) or _format_day_table_html("Неделя", [])
+        msg = _truncate_message("📢 Обновлено расписание на неделю:\n\n" + week_html)
+        asyncio.create_task(_notify_subscribers(msg))
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/admin/day")
+async def api_admin_day(request: Request):
+    data = await request.json()
+    raw_user = data.get("user")
+    user = None
+    if isinstance(raw_user, dict) and "id" in raw_user:
+        user = raw_user
+    else:
+        init_data = data.get("init_data", "")
+        user = _get_user_from_init_data(init_data)
+    if not user:
+        return JSONResponse({"ok": False, "error": "bad_init_data"}, status_code=400)
+    user_id = int(user["id"])
+    if not _is_admin_user_id(user_id):
+        return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
+
+    day = (data.get("day") or "").strip()
+    if day not in SCHEDULE_DAYS:
+        return JSONResponse({"ok": False, "error": "bad_day"}, status_code=400)
+
+    mode = (data.get("mode") or "base").strip()
+    lessons_text = data.get("lessons_text", "") or ""
+    lessons = _parse_lessons_from_text(lessons_text)
+    if lessons is None:
+        return JSONResponse({"ok": False, "error": "bad_format"}, status_code=400)
+
+    if mode == "temp":
+        date_str = (data.get("date") or "").strip()
+        if date_str:
+            try:
+                d = datetime.fromisoformat(date_str).date()
+            except ValueError:
+                return JSONResponse({"ok": False, "error": "bad_date"}, status_code=400)
+        else:
+            # если дата не указана — берём текущую неделю и соответствующий день
+            now_tz = datetime.now(tz=_get_tz())
+            today_idx = now_tz.weekday()
+            target_idx = SCHEDULE_DAYS.index(day)
+            delta = target_idx - today_idx
+            d = (now_tz + timedelta(days=delta)).date()
+        key = d.isoformat()
+        temp_schedule[key] = lessons
+        try:
+            _save_temp_schedule_to_disk()
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        label = f"{d.strftime('%d.%m.%Y')} ({DAY_MAP.get(d.strftime('%A'), d.strftime('%A'))})"
+        msg = "📢 Временное расписание обновлено:\n\n" + _format_day_table_html(label, lessons)
+        asyncio.create_task(_notify_subscribers(_truncate_message(msg)))
+    else:
+        schedule[day] = lessons
+        try:
+            _save_schedule_to_disk()
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        msg = "📢 Обновлено расписание:\n\n" + _format_day_table_html(day, lessons)
+        asyncio.create_task(_notify_subscribers(_truncate_message(msg)))
+
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/admin/day_get")
+async def api_admin_day_get(request: Request):
+    """Возвращает список строк уроков для дня/режима (для предзаполнения формы)."""
+    data = await request.json()
+    raw_user = data.get("user")
+    user = None
+    if isinstance(raw_user, dict) and "id" in raw_user:
+        user = raw_user
+    else:
+        init_data = data.get("init_data", "")
+        user = _get_user_from_init_data(init_data)
+    if not user:
+        return JSONResponse({"ok": False, "error": "bad_init_data"}, status_code=400)
+    user_id = int(user["id"])
+    if not _is_admin_user_id(user_id):
+        return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
+
+    day = (data.get("day") or "").strip()
+    if day not in SCHEDULE_DAYS:
+        return JSONResponse({"ok": False, "error": "bad_day"}, status_code=400)
+    mode = (data.get("mode") or "base").strip()
+
+    lessons: list[str] = []
+    if mode == "temp":
+        date_str = (data.get("date") or "").strip()
+        d: date | None = None
+        if date_str:
+            try:
+                d = datetime.fromisoformat(date_str).date()
+            except ValueError:
+                d = None
+        if d is None:
+            now_tz = datetime.now(tz=_get_tz())
+            today_idx = now_tz.weekday()
+            target_idx = SCHEDULE_DAYS.index(day)
+            delta = target_idx - today_idx
+            d = (now_tz + timedelta(days=delta)).date()
+        key = d.isoformat()
+        raw = temp_schedule.get(key)
+        if isinstance(raw, list):
+            lessons = raw
+        if not lessons:
+            base = schedule.get(day)
+            if isinstance(base, list):
+                lessons = base
+    else:
+        base = schedule.get(day)
+        if isinstance(base, list):
+            lessons = base
+
+    return JSONResponse({"ok": True, "lessons": lessons})
+
+
+@app.post("/api/admin/week_get")
+async def api_admin_week_get(request: Request):
+    """Возвращает расписание недели в текстовом формате для предзаполнения формы."""
+    data = await request.json()
+    raw_user = data.get("user")
+    user = None
+    if isinstance(raw_user, dict) and "id" in raw_user:
+        user = raw_user
+    else:
+        init_data = data.get("init_data", "")
+        user = _get_user_from_init_data(init_data)
+    if not user:
+        return JSONResponse({"ok": False, "error": "bad_init_data"}, status_code=400)
+    user_id = int(user["id"])
+    if not _is_admin_user_id(user_id):
+        return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
+
+    mode = (data.get("mode") or "base").strip()
+    lines: list[str] = []
+
+    now_tz = datetime.now(tz=_get_tz())
+    monday = (now_tz - timedelta(days=now_tz.weekday())).date()
+
+    for offset, day in enumerate(SCHEDULE_DAYS):
+        target_date = monday + timedelta(days=offset)
+        key = target_date.isoformat()
+
+        if day == "Суббота":
+            # Суббота — всегда по профилям
+            if mode == "temp":
+                raw = temp_schedule.get(key)
+                if isinstance(raw, dict):
+                    sat_data = raw
+                elif isinstance(raw, list):
+                    # legacy list — выводим как обычный день
+                    if raw:
+                        lines.append(f"{day}:")
+                        lines.extend(raw)
+                        lines.append("")
+                    continue
+                else:
+                    sat_data = schedule.get("Суббота")
+            else:
+                sat_data = schedule.get("Суббота")
+
+            if isinstance(sat_data, dict):
+                for pk in SATURDAY_PROFILE_KEYS:
+                    profile_lessons = sat_data.get(pk, [])
+                    if profile_lessons:
+                        label = SATURDAY_PROFILE_LABELS.get(pk, pk)
+                        lines.append(f"Суббота {label}:")
+                        lines.extend(profile_lessons)
+                        lines.append("")
+            elif isinstance(sat_data, list) and sat_data:
+                lines.append(f"{day}:")
+                lines.extend(sat_data)
+                lines.append("")
+            continue
+
+        # Обычный день
+        lessons: list[str] = []
+        if mode == "temp":
+            raw = temp_schedule.get(key)
+            if isinstance(raw, list):
+                lessons = raw
+            if not lessons:
+                base = schedule.get(day)
+                if isinstance(base, list):
+                    lessons = base
+        else:
+            base = schedule.get(day)
+            if isinstance(base, list):
+                lessons = base
+
+        if lessons:
+            lines.append(f"{day}:")
+            lines.extend(lessons)
+            lines.append("")
+
+    return JSONResponse({"ok": True, "week_text": "\n".join(lines).strip()})
+
+
+@app.post("/api/admin/subscribe_chat")
+async def api_admin_subscribe_chat(request: Request):
+    """Добавляет или обновляет подписку для группового чата."""
+    data = await request.json()
+    raw_user = data.get("user")
+    user = None
+    if isinstance(raw_user, dict) and "id" in raw_user:
+        user = raw_user
+    else:
+        init_data = data.get("init_data", "")
+        user = _get_user_from_init_data(init_data)
+    if not user:
+        return JSONResponse({"ok": False, "error": "bad_init_data"}, status_code=400)
+    user_id = int(user["id"])
+    if not _is_admin_user_id(user_id):
+        return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
+
+    chat_id_raw = str(data.get("chat_id") or "").strip()
+    if not chat_id_raw or not re.match(r"^-?\d+$", chat_id_raw):
+        return JSONResponse({"ok": False, "error": "bad_chat_id"}, status_code=400)
+    chat_id = int(chat_id_raw)
+
+    time_str = data.get("time", "")
+    parsed = _parse_hhmm(time_str)
+    if not parsed:
+        return JSONResponse({"ok": False, "error": "bad_time"}, status_code=400)
+    hh, mm = parsed
+    t = f"{hh:02d}:{mm:02d}"
+
+    day_type = data.get("day_type", "today")
+    if day_type not in {"today", "tomorrow"}:
+        day_type = "today"
+
+    sub_key = str(chat_id)
+    subscriptions[sub_key] = {"chat_id": chat_id, "time": t, "day_type": day_type}
+    _save_subscriptions_to_disk()
+    _reschedule_user(chat_id)
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/admin/subscriptions_list")
+async def api_admin_subscriptions_list(request: Request):
+    """Возвращает список всех подписок кроме личной подписки текущего пользователя."""
+    data = await request.json()
+    raw_user = data.get("user")
+    user = None
+    if isinstance(raw_user, dict) and "id" in raw_user:
+        user = raw_user
+    else:
+        init_data = data.get("init_data", "")
+        user = _get_user_from_init_data(init_data)
+    if not user:
+        return JSONResponse({"ok": False, "error": "bad_init_data"}, status_code=400)
+    user_id = int(user["id"])
+    if not _is_admin_user_id(user_id):
+        return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
+
+    result = []
+    for key, entry in subscriptions.items():
+        cid = entry.get("chat_id")
+        if cid is not None and int(cid) != user_id:
+            result.append({
+                "chat_id": cid,
+                "time": entry.get("time", ""),
+                "day_type": entry.get("day_type", "today"),
+            })
+    return JSONResponse({"ok": True, "subscriptions": result})
+
+
+@app.post("/api/admin/unsubscribe_chat")
+async def api_admin_unsubscribe_chat(request: Request):
+    """Удаляет подписку для группового чата."""
+    data = await request.json()
+    raw_user = data.get("user")
+    user = None
+    if isinstance(raw_user, dict) and "id" in raw_user:
+        user = raw_user
+    else:
+        init_data = data.get("init_data", "")
+        user = _get_user_from_init_data(init_data)
+    if not user:
+        return JSONResponse({"ok": False, "error": "bad_init_data"}, status_code=400)
+    user_id = int(user["id"])
+    if not _is_admin_user_id(user_id):
+        return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
+
+    chat_id_raw = str(data.get("chat_id") or "").strip()
+    if not chat_id_raw or not re.match(r"^-?\d+$", chat_id_raw):
+        return JSONResponse({"ok": False, "error": "bad_chat_id"}, status_code=400)
+    chat_id = int(chat_id_raw)
+
+    subscriptions.pop(str(chat_id), None)
+    _save_subscriptions_to_disk()
+    if scheduler is not None:
+        try:
+            scheduler.remove_job(_job_id_for(chat_id))
+        except Exception:
+            pass
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/admin/admins_list")
+async def api_admin_admins_list(request: Request):
+    """Список динамических админов (только для суперадмина)."""
+    data = await request.json()
+    raw_user = data.get("user")
+    user = None
+    if isinstance(raw_user, dict) and "id" in raw_user:
+        user = raw_user
+    else:
+        user = _get_user_from_init_data(data.get("init_data", ""))
+    if not user:
+        return JSONResponse({"ok": False, "error": "bad_init_data"}, status_code=400)
+    user_id = int(user["id"])
+    if not _is_superadmin_user_id(user_id):
+        return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
+    return JSONResponse({"ok": True, "admins": sorted(dynamic_admins)})
+
+
+@app.post("/api/admin/admin_add")
+async def api_admin_admin_add(request: Request):
+    """Добавить динамического админа (только для суперадмина)."""
+    data = await request.json()
+    raw_user = data.get("user")
+    user = None
+    if isinstance(raw_user, dict) and "id" in raw_user:
+        user = raw_user
+    else:
+        user = _get_user_from_init_data(data.get("init_data", ""))
+    if not user:
+        return JSONResponse({"ok": False, "error": "bad_init_data"}, status_code=400)
+    user_id = int(user["id"])
+    if not _is_superadmin_user_id(user_id):
+        return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
+    target_raw = str(data.get("target_user_id") or "").strip()
+    if not target_raw or not re.match(r"^\d+$", target_raw):
+        return JSONResponse({"ok": False, "error": "bad_user_id"}, status_code=400)
+    target_id = int(target_raw)
+    if _is_superadmin_user_id(target_id):
+        return JSONResponse({"ok": False, "error": "already_superadmin"}, status_code=400)
+    dynamic_admins.add(target_id)
+    _save_dynamic_admins()
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/admin/admin_remove")
+async def api_admin_admin_remove(request: Request):
+    """Удалить динамического админа (только для суперадмина)."""
+    data = await request.json()
+    raw_user = data.get("user")
+    user = None
+    if isinstance(raw_user, dict) and "id" in raw_user:
+        user = raw_user
+    else:
+        user = _get_user_from_init_data(data.get("init_data", ""))
+    if not user:
+        return JSONResponse({"ok": False, "error": "bad_init_data"}, status_code=400)
+    user_id = int(user["id"])
+    if not _is_superadmin_user_id(user_id):
+        return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
+    target_raw = str(data.get("target_user_id") or "").strip()
+    if not target_raw or not re.match(r"^\d+$", target_raw):
+        return JSONResponse({"ok": False, "error": "bad_user_id"}, status_code=400)
+    target_id = int(target_raw)
+    dynamic_admins.discard(target_id)
+    _save_dynamic_admins()
+    return JSONResponse({"ok": True})
