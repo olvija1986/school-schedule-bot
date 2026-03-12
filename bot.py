@@ -247,8 +247,15 @@ def _save_dynamic_admins() -> None:
     os.replace(tmp, ADMINS_PATH)
 
 # ================== Загрузка расписания ==================
-with open("schedule.json", "r", encoding="utf-8") as f:
-    schedule = json.load(f)
+try:
+    with open("schedule.json", "r", encoding="utf-8") as f:
+        schedule = json.load(f)
+except FileNotFoundError:
+    logger.warning("schedule.json не найден — будет загружен из Google Sheets при старте")
+    schedule = {}
+except Exception as e:
+    logger.error(f"Ошибка чтения schedule.json: {e}")
+    schedule = {}
 
 TEMP_SCHEDULE_PATH = "temp_schedule.json"
 temp_schedule: dict[str, list[str]] = {}
