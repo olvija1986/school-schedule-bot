@@ -106,10 +106,20 @@ def _gs_load_schedule() -> dict | None:
             if len(row) < 2 or not row[0].strip():
                 continue
             day, raw = row[0].strip(), row[1].strip()
+            # Пропускаем заголовок и строки не являющиеся днями недели
+            if day not in SCHEDULE_DAYS:
+                continue
+            if not raw:
+                continue
             try:
                 result[day] = json.loads(raw)
-            except Exception:
-                pass
+            except json.JSONDecodeError:
+                # Пробуем исправить одинарные кавычки (питоновский repr)
+                try:
+                    import ast
+                    result[day] = ast.literal_eval(raw)
+                except Exception:
+                    logger.warning(f"_gs_load_schedule: не удалось распарсить '{day}'")
         return result if result else None
     except Exception as e:
         logger.error(f"_gs_load_schedule error: {e}")
