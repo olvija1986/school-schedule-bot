@@ -2563,7 +2563,8 @@ def _alice_resp(text: str, tts: str, session: dict, end_session: bool = False,
                 buttons: list | None = None,
                 user_state_patch: dict | None = None) -> dict:
     """Конструктор ответа Алисы.
-    user_state_patch — поля для обновления постоянного user.state (сохраняется между сессиями).
+    user_state_patch — записывается в user_state_update И application_state_update,
+    чтобы работало и для авторизованных и для гостевых пользователей.
     """
     resp: dict = {
         "version": "1.0",
@@ -2575,8 +2576,9 @@ def _alice_resp(text: str, tts: str, session: dict, end_session: bool = False,
             "buttons": buttons or [],
         },
     }
-    if user_state_patch:
-        resp["user_state_update"] = user_state_patch
+    if user_state_patch is not None:
+        resp["user_state_update"]        = user_state_patch
+        resp["application_state_update"] = user_state_patch
     return resp
 
 
@@ -2760,7 +2762,6 @@ def _alice_saturday_response(target_date, day_type: str, saved_profile: str | No
                 label_to_key[lbl] = k
                 break
 
-    # Кнопки смены профиля — всегда одинаковые после показа расписания
     def _btns_after_show() -> list[dict]:
         return [{"title": "На сегодня",     "hide": True},
                 {"title": "На завтра",       "hide": True},
@@ -2776,7 +2777,8 @@ def _alice_saturday_response(target_date, day_type: str, saved_profile: str | No
         display = f"{prefix}, суббота.\n\n" + "\n\n".join(parts_text)
         tts = f"{prefix} суббота. " + " ".join(parts_tts)
         return _alice_resp(_alice_truncate(display, 1020), _alice_truncate(tts),
-                           session, buttons=_btns_after_show())
+                           session, buttons=_btns_after_show(),
+                           user_state_patch={"sat_profile": "__ALL__"})
 
     # Сохранённый конкретный профиль
     if saved_profile:
@@ -2786,16 +2788,21 @@ def _alice_saturday_response(target_date, day_type: str, saved_profile: str | No
             label_out = SATURDAY_PROFILE_LABELS.get(saved_profile, saved_profile)
             display = f"{prefix}, суббота — {label_out}\n{_alice_format_screen(lessons_out)}"
             tts = f"{prefix} суббота, {_alice_profile_tts(label_out)}. {_alice_format_tts(lessons_out)}"
+            # Подтверждаем сохранение профиля при каждом показе
             return _alice_resp(_alice_truncate(display, 1020), _alice_truncate(tts),
-                               session, buttons=_btns_after_show())
+                               session, buttons=_btns_after_show(),
+                               user_state_patch={"sat_profile": saved_profile})
 
     # Нет сохранённого профиля — показываем список кнопок
     if len(active) == 1:
         lbl, les = active[0]
         display = f"{prefix}, суббота — {lbl}\n{_alice_format_screen(les)}"
         tts = f"{prefix} суббота. {_alice_format_tts(les)}"
+        # Сохраняем единственный профиль автоматически
+        profile_key = label_to_key.get(lbl, lbl)
         return _alice_resp(_alice_truncate(display, 1020), _alice_truncate(tts),
-                           session, buttons=_ALICE_MAIN_BUTTONS)
+                           session, buttons=_ALICE_MAIN_BUTTONS,
+                           user_state_patch={"sat_profile": profile_key})
 
     labels_txt = ", ".join(lbl for lbl, _ in active)
     labels_tts = ", ".join(_alice_profile_tts(lbl) for lbl, _ in active)
@@ -2811,13 +2818,16 @@ def _alice_handle_request(req_body: dict) -> dict:
     """Основная логика обработки запроса от Алисы."""
     session    = req_body.get("session") or {}
     request    = req_body.get("request") or {}
-    user_state = (req_body.get("state") or {}).get("user") or {}
+    state      = req_body.get("state") or {}
+    user_state = state.get("user") or {}
+    app_state  = state.get("application") or {}
 
     command       = (request.get("command") or "").lower().strip()
     original      = (request.get("original_utterance") or "").lower().strip()
     txt           = command or original
     is_new        = session.get("new", False)
-    saved_profile = user_state.get("sat_profile") or None  # "" → None
+    # user_state приоритетнее application_state; "" считаем как None (сброс)
+    saved_profile = (user_state.get("sat_profile") or app_state.get("sat_profile") or "") or None
 
     now = datetime.now(tz=_get_tz())
 
