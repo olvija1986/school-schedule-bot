@@ -240,8 +240,76 @@ def _gs_save_subscriptions() -> None:
         logger.error(f"_gs_save_subscriptions error: {e}")
 
 
+def _gs_load_alice_profiles() -> dict | None:
+    """Загружает профили пользователей Алисы. Формат: alice_user_id | profile_key"""
+    try:
+        ws = _gs_sheet("alice_profiles")
+        if ws is None:
+            return None
+        rows = ws.get_all_values()
+        if not rows:
+            return {}
+        result = {}
+        for row in rows:
+            if len(row) >= 2 and row[0].strip():
+                result[row[0].strip()] = row[1].strip()
+        return result
+    except Exception as e:
+        logger.error(f"_gs_load_alice_profiles error: {e}")
+        return None
 
-# Необязательно: ограничение доступа к редактированию расписания
+
+def _gs_save_alice_profiles() -> None:
+    try:
+        ws = _gs_sheet("alice_profiles")
+        if ws is None:
+            return
+        rows = [[uid, profile] for uid, profile in alice_profiles.items() if profile]
+        ws.clear()
+        if rows:
+            ws.update(rows, value_input_option="RAW")
+    except Exception as e:
+        logger.error(f"_gs_save_alice_profiles error: {e}")
+
+
+def _load_alice_profiles_from_disk() -> None:
+    global alice_profiles
+    try:
+        with open(ALICE_PROFILES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            alice_profiles = data
+    except FileNotFoundError:
+        alice_profiles = {}
+    except Exception:
+        alice_profiles = {}
+
+
+def _save_alice_profiles_to_disk() -> None:
+    tmp = ALICE_PROFILES_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(alice_profiles, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, ALICE_PROFILES_PATH)
+    if _gs_spreadsheet is not None:
+        _gs_save_alice_profiles()
+
+
+def _alice_set_profile(user_id: str, profile_key: str) -> None:
+    """Сохраняет выбранный профиль для пользователя Алисы."""
+    if not user_id:
+        return
+    if profile_key:
+        alice_profiles[user_id] = profile_key
+    else:
+        alice_profiles.pop(user_id, None)
+    _save_alice_profiles_to_disk()
+
+
+def _alice_get_profile(user_id: str) -> str | None:
+    """Возвращает сохранённый профиль пользователя Алисы или None."""
+    if not user_id:
+        return None
+    return alice_profiles.get(user_id) or None
 # Формат: "12345,67890"
 _ADMIN_USER_IDS_RAW = (os.environ.get("ADMIN_USER_IDS") or "").strip()
 ADMIN_USER_IDS = {
@@ -294,6 +362,10 @@ temp_schedule: dict[str, list[str]] = {}
 SUBSCRIPTIONS_PATH = "subscriptions.json"
 subscriptions: dict[str, dict] = {}
 scheduler: AsyncIOScheduler | None = None
+
+# Профили Алисы: alice_user_id → profile_key (сохраняется в GSheets лист alice_profiles)
+ALICE_PROFILES_PATH = "alice_profiles.json"
+alice_profiles: dict[str, str] = {}
 
 SCHEDULE_DAYS = [
     "Понедельник",
@@ -2651,10 +2723,9 @@ def _alice_saturday_buttons(day_type: str = "today") -> list[dict] | None:
     return buttons
 
 
-def _alice_try_saturday_profile(text: str, session: dict) -> dict | None:
-    """Если пользователь назвал профиль субботы — возвращает расписание этого профиля.
-    Проверяем сегодня, завтра и ближайшую субботу в пределах недели.
-    """
+def _alice_try_saturday_profile(text: str, session: dict,
+                                 alice_uid: str = "") -> dict | None:
+    """Если пользователь назвал профиль субботы — сохраняет и возвращает расписание."""
     now = datetime.now(tz=_get_tz())
     today = now.date()
 
@@ -2729,6 +2800,7 @@ def _alice_try_saturday_profile(text: str, session: dict) -> dict | None:
         return _alice_resp(msg, msg, session, buttons=btns)
 
     if matched_key:
+        _alice_set_profile(alice_uid, matched_key)
         label_out = SATURDAY_PROFILE_LABELS.get(matched_key, matched_key)
         lessons_out = next((l for lbl, l in active if label_to_key.get(lbl) == matched_key), [])
         display = f"{prefix}, суббота — {label_out}\n{_alice_format_screen(lessons_out)}"
@@ -2738,13 +2810,12 @@ def _alice_try_saturday_profile(text: str, session: dict) -> dict | None:
                 {"title": "Все профили",     "hide": True},
                 {"title": "Сменить профиль", "hide": True}]
         return _alice_resp(_alice_truncate(display, 1020), _alice_truncate(tts),
-                           session, buttons=btns,
-                           user_state_patch={"sat_profile": matched_key})
+                           session, buttons=btns)
     return None
 
 
 def _alice_saturday_response(target_date, day_type: str, saved_profile: str | None,
-                              session: dict) -> dict:
+                              session: dict, alice_uid: str = "") -> dict:
     """Формирует ответ для субботы с учётом сохранённого профиля."""
     prefix = "Сегодня" if day_type == "today" else "Завтра"
     profiles = _get_saturday_profiles_for_date(target_date)
@@ -2754,7 +2825,6 @@ def _alice_saturday_response(target_date, day_type: str, saved_profile: str | No
         msg = f"{prefix}, суббота. Занятий нет."
         return _alice_resp(msg, msg, session, buttons=_ALICE_MAIN_BUTTONS)
 
-    # label→key
     label_to_key: dict[str, str] = {}
     for lbl, _ in active:
         for k, l in SATURDAY_PROFILE_LABELS.items():
@@ -2777,8 +2847,7 @@ def _alice_saturday_response(target_date, day_type: str, saved_profile: str | No
         display = f"{prefix}, суббота.\n\n" + "\n\n".join(parts_text)
         tts = f"{prefix} суббота. " + " ".join(parts_tts)
         return _alice_resp(_alice_truncate(display, 1020), _alice_truncate(tts),
-                           session, buttons=_btns_after_show(),
-                           user_state_patch={"sat_profile": "__ALL__"})
+                           session, buttons=_btns_after_show())
 
     # Сохранённый конкретный профиль
     if saved_profile:
@@ -2788,22 +2857,20 @@ def _alice_saturday_response(target_date, day_type: str, saved_profile: str | No
             label_out = SATURDAY_PROFILE_LABELS.get(saved_profile, saved_profile)
             display = f"{prefix}, суббота — {label_out}\n{_alice_format_screen(lessons_out)}"
             tts = f"{prefix} суббота, {_alice_profile_tts(label_out)}. {_alice_format_tts(lessons_out)}"
-            # Подтверждаем сохранение профиля при каждом показе
             return _alice_resp(_alice_truncate(display, 1020), _alice_truncate(tts),
-                               session, buttons=_btns_after_show(),
-                               user_state_patch={"sat_profile": saved_profile})
+                               session, buttons=_btns_after_show())
 
-    # Нет сохранённого профиля — показываем список кнопок
+    # Нет профиля — единственный сохраняем автоматически
     if len(active) == 1:
         lbl, les = active[0]
+        profile_key = label_to_key.get(lbl, lbl)
+        _alice_set_profile(alice_uid, profile_key)
         display = f"{prefix}, суббота — {lbl}\n{_alice_format_screen(les)}"
         tts = f"{prefix} суббота. {_alice_format_tts(les)}"
-        # Сохраняем единственный профиль автоматически
-        profile_key = label_to_key.get(lbl, lbl)
         return _alice_resp(_alice_truncate(display, 1020), _alice_truncate(tts),
-                           session, buttons=_ALICE_MAIN_BUTTONS,
-                           user_state_patch={"sat_profile": profile_key})
+                           session, buttons=_ALICE_MAIN_BUTTONS)
 
+    # Несколько профилей — показываем список
     labels_txt = ", ".join(lbl for lbl, _ in active)
     labels_tts = ", ".join(_alice_profile_tts(lbl) for lbl, _ in active)
     msg_txt = f"{prefix}, суббота.\nПрофили: {labels_txt}.\nВыбери профиль или скажи его название."
@@ -2818,16 +2885,19 @@ def _alice_handle_request(req_body: dict) -> dict:
     """Основная логика обработки запроса от Алисы."""
     session    = req_body.get("session") or {}
     request    = req_body.get("request") or {}
-    state      = req_body.get("state") or {}
-    user_state = state.get("user") or {}
-    app_state  = state.get("application") or {}
 
     command       = (request.get("command") or "").lower().strip()
     original      = (request.get("original_utterance") or "").lower().strip()
     txt           = command or original
     is_new        = session.get("new", False)
-    # user_state приоритетнее application_state; "" считаем как None (сброс)
-    saved_profile = (user_state.get("sat_profile") or app_state.get("sat_profile") or "") or None
+
+    # user_id — берём из session.user.user_id (авторизованные) или session.application.application_id
+    session_user = session.get("user") or {}
+    session_app  = session.get("application") or {}
+    alice_uid    = (session_user.get("user_id") or session_app.get("application_id") or "").strip()
+
+    # Профиль с нашего сервера — надёжно между сессиями
+    saved_profile: str | None = _alice_get_profile(alice_uid)
 
     now = datetime.now(tz=_get_tz())
 
@@ -2847,14 +2917,14 @@ def _alice_handle_request(req_body: dict) -> dict:
         btns.append({"title": "На завтра",   "hide": True})
         return btns
 
-    # ── «Все профили» — сохранить __ALL__ и показать все ─────────────────────
-    # Обрабатываем ДО всего остального — кнопка приходит в любой день
+    # ── «Все профили» ────────────────────────────────────────────────────────
     if "все профили" in txt:
         dt, sd = _nearest_sat()
         if sd:
             profiles = _get_saturday_profiles_for_date(sd)
             active = [(l, les) for l, les in profiles if les]
             if active:
+                _alice_set_profile(alice_uid, "__ALL__")
                 prefix = "Сегодня" if dt == "today" else "Завтра"
                 parts_d = [f"{l}:\n{_alice_format_screen(les)}" for l, les in active]
                 parts_t = [f"{_alice_profile_tts(l)}. {_alice_format_tts(les)}" for l, les in active]
@@ -2864,11 +2934,11 @@ def _alice_handle_request(req_body: dict) -> dict:
                         {"title": "На завтра",       "hide": True},
                         {"title": "Сменить профиль", "hide": True}]
                 return _alice_resp(_alice_truncate(display, 1020), _alice_truncate(tts),
-                                   session, buttons=btns,
-                                   user_state_patch={"sat_profile": "__ALL__"})
+                                   session, buttons=btns)
 
-    # ── «Сменить профиль» — сбросить и показать список ───────────────────────
+    # ── «Сменить профиль» ────────────────────────────────────────────────────
     if any(w in txt for w in ["сменить профиль", "другой профиль", "другое"]):
+        _alice_set_profile(alice_uid, "")
         dt, sd = _nearest_sat()
         if sd:
             profiles = _get_saturday_profiles_for_date(sd)
@@ -2880,8 +2950,7 @@ def _alice_handle_request(req_body: dict) -> dict:
                 msg_d = f"{prefix}, суббота.\nПрофили: {labels_d}.\nВыбери профиль."
                 msg_t = f"Выбери профиль. {labels_t}."
                 return _alice_resp(msg_d, _alice_truncate(msg_t), session,
-                                   buttons=_sat_list_buttons(active),
-                                   user_state_patch={"sat_profile": ""})
+                                   buttons=_sat_list_buttons(active))
         display, tts = _alice_day_text("today")
         return _alice_resp(_alice_truncate(display, 1020), _alice_truncate(tts),
                            session, buttons=_ALICE_MAIN_BUTTONS)
@@ -2893,7 +2962,7 @@ def _alice_handle_request(req_body: dict) -> dict:
     ]):
         target = now.date()
         if target.strftime("%A") == "Saturday":
-            return _alice_saturday_response(target, "today", saved_profile, session)
+            return _alice_saturday_response(target, "today", saved_profile, session, alice_uid)
         display, tts = _alice_day_text("today")
         return _alice_resp(_alice_truncate(display, 1020), _alice_truncate(tts),
                            session, buttons=_ALICE_MAIN_BUTTONS)
@@ -2905,7 +2974,7 @@ def _alice_handle_request(req_body: dict) -> dict:
     ]):
         target = (now + timedelta(days=1)).date()
         if target.strftime("%A") == "Saturday":
-            return _alice_saturday_response(target, "tomorrow", saved_profile, session)
+            return _alice_saturday_response(target, "tomorrow", saved_profile, session, alice_uid)
         display, tts = _alice_day_text("tomorrow")
         return _alice_resp(_alice_truncate(display, 1020), _alice_truncate(tts),
                            session, buttons=_ALICE_MAIN_BUTTONS)
@@ -2914,13 +2983,13 @@ def _alice_handle_request(req_body: dict) -> dict:
     if any(w in txt for w in ["расписание", "уроки", "занятия", "какие уроки"]):
         target = now.date()
         if target.strftime("%A") == "Saturday":
-            return _alice_saturday_response(target, "today", saved_profile, session)
+            return _alice_saturday_response(target, "today", saved_profile, session, alice_uid)
         display, tts = _alice_day_text("today")
         return _alice_resp(_alice_truncate(display, 1020), _alice_truncate(tts),
                            session, buttons=_ALICE_MAIN_BUTTONS)
 
     # ── Выбор конкретного профиля субботы (кнопка или голос) ─────────────────
-    sat_resp = _alice_try_saturday_profile(txt, session)
+    sat_resp = _alice_try_saturday_profile(txt, session, alice_uid)
     if sat_resp:
         return sat_resp
 
@@ -3011,10 +3080,16 @@ async def startup_event():
             global subscriptions
             subscriptions = gs_subs
             logger.info("📊 Подписки загружены из Google Sheets")
+        gs_ap = _gs_load_alice_profiles()
+        if gs_ap is not None:
+            global alice_profiles
+            alice_profiles = gs_ap
+            logger.info("📊 Профили Алисы загружены из Google Sheets")
     else:
         # Fallback: локальные файлы
         _load_temp_schedule_from_disk()
         _load_subscriptions_from_disk()
+        _load_alice_profiles_from_disk()
 
     scheduler = AsyncIOScheduler(timezone=_get_tz())
     if _gs_spreadsheet is None:
