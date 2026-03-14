@@ -1801,13 +1801,38 @@ async def edit_schedule_saturday_profile_chosen(update: Update, context: Context
     )
     return EDIT_ENTER_LESSONS
 
+def _normalize_lesson_line(line: str) -> str:
+    """Нормализует строку урока: точки в времени → двоеточие, обрезает название до 16 символов."""
+    import re as _re
+    line = line.strip()
+    # 08.30-09.05 или 08.30–09.05 → 08:30-09:05
+    def fix_time(m):
+        return m.group(1) + ':' + m.group(2)
+    line = _re.sub(r'(?<!\d)(\d{1,2})[.](\d{2})(?!\d)', fix_time, line)
+    # Обрезаем название предмета до 16 символов (часть до кабинета)
+    m = _re.match(r'^(\d{1,2}:\d{2})\s*[-–]\s*(\d{1,2}:\d{2})\s+(.+)$', line)
+    if m:
+        time_part = f"{m.group(1)}-{m.group(2)}"
+        rest = m.group(3)
+        if '/' in rest:
+            subj, room = rest.split('/', 1)
+            subj = subj.strip()
+            if len(subj) > 16:
+                subj = subj[:16].rstrip()
+            line = f"{time_part} {subj}/{room}"
+        else:
+            if len(rest) > 16:
+                rest = rest[:16].rstrip()
+            line = f"{time_part} {rest}"
+    return line
+
 def _parse_lessons_from_text(text: str) -> list[str] | None:
     text = (text or "").strip()
     if not text:
         return None
     if text.lower() in {"пусто", "нет", "clear"}:
         return []
-    return [line.strip() for line in text.splitlines() if line.strip()]
+    return [_normalize_lesson_line(line) for line in text.splitlines() if line.strip()]
 
 def _parse_saturday_all_profiles(text: str) -> dict[str, list[str]] | None:
     """Парсит текст вида:
@@ -3735,12 +3760,13 @@ WEBAPP_HTML = """<!DOCTYPE html>
         const raw = (line || '').trim();
         if (!raw) return;
         let start = '', end = '', subject = '', room = '';
-        const m = raw.match(/^(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})\s+(.+)$/);
+        // принимаем и двоеточие, и точку как разделитель в времени
+        const m = raw.match(/^(\d{1,2}[:.]\d{2})\s*[-–]\s*(\d{1,2}[:.]\d{2})\s+(.+)$/);
         let rest = raw;
         if (m) {
-          start = m[1];
-          end = m[2];
-          rest = m[3];
+          start = m[1].replace('.', ':');
+          end   = m[2].replace('.', ':');
+          rest  = m[3];
         }
         if (rest.includes('/')) {
           const parts = rest.split('/');
@@ -3967,11 +3993,12 @@ WEBAPP_HTML = """<!DOCTYPE html>
       const rows = Array.from(adminLessonRows.querySelectorAll('.lesson-entry'));
       const parsed = [];
       rows.forEach((row) => {
-        const subject = (row.querySelector('.lesson-subject').value || '').trim();
-        const room    = (row.querySelector('.lesson-room').value   || '').trim();
-        const start   = (row.querySelector('.lesson-start').value  || '');
-        const end     = (row.querySelector('.lesson-end').value    || '');
+        let subject = (row.querySelector('.lesson-subject').value || '').trim();
+        const room  = (row.querySelector('.lesson-room').value   || '').trim();
+        let start   = (row.querySelector('.lesson-start').value  || '').replace('.', ':');
+        let end     = (row.querySelector('.lesson-end').value    || '').replace('.', ':');
         if (!subject) return;
+        if (subject.length > 16) subject = subject.slice(0, 16).trimEnd();
         const roomPart = room ? '/' + room : '';
         parsed.push({ start, line: `${start}-${end} ${subject}${roomPart}`.trim() });
       });
