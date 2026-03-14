@@ -322,6 +322,7 @@ SATURDAY_PROFILES: list[tuple[str, str]] = [
     ("Инфотех_1", "Инфотех 1 группа"),
     ("Инфотех_2", "Инфотех 2 группа"),
     ("Общеобразовательный_3", "Общеобр-ый 3 группа"),
+    ("Соцгум", "Соцгум"),
 ]
 SATURDAY_PROFILE_KEYS = [k for k, _ in SATURDAY_PROFILES]
 SATURDAY_PROFILE_LABELS = {k: label for k, label in SATURDAY_PROFILES}
@@ -3379,6 +3380,7 @@ WEBAPP_HTML = """<!DOCTYPE html>
       <button id="btn-sat-prof-3" class="sched-chip" data-type="sat_profile:Инфотех_1">Инфотех 1</button>
       <button id="btn-sat-prof-4" class="sched-chip" data-type="sat_profile:Инфотех_2">Инфотех 2</button>
       <button id="btn-sat-prof-5" class="sched-chip" data-type="sat_profile:Общеобразовательный_3">Общеобр. 3</button>
+      <button id="btn-sat-prof-6" class="sched-chip" data-type="sat_profile:Соцгум">Соцгум</button>
     </div>
     <div id="schedule-box"></div>
   </div>
@@ -3537,6 +3539,7 @@ WEBAPP_HTML = """<!DOCTYPE html>
         <button class="sched-chip sat-prof-btn" data-profile="Инфотех_1">Инфотех 1</button>
         <button class="sched-chip sat-prof-btn" data-profile="Инфотех_2">Инфотех 2</button>
         <button class="sched-chip sat-prof-btn" data-profile="Общеобразовательный_3">Общеобр. 3</button>
+        <button class="sched-chip sat-prof-btn" data-profile="Соцгум">Соцгум</button>
       </div>
       <div class="editor-scroll">
         <div id="admin-lesson-rows"></div>
